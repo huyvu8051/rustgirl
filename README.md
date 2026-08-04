@@ -1,5 +1,6 @@
 # RustGirl
 
+[![CI](https://github.com/huyvu8051/rustgirl/actions/workflows/ci.yml/badge.svg)](https://github.com/huyvu8051/rustgirl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/huyvu8051/rustgirl)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-informational)](#getting-started)
