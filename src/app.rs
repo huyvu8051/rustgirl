@@ -1,8 +1,9 @@
 use crate::http_client::{self, HttpResponse, RequestOutcome, SentRequest};
 use crate::model::{
-    self, AppData, BodyMode, Collection, Environment, Folder, HistoryEntry, KeyValue, Method,
-    RequestItem,
+    self, AppData, BodyMode, Collection, Environment, Folder, FormField, FormFieldType,
+    HistoryEntry, KeyValue, Method, RequestItem, TestResult,
 };
+use crate::scripting;
 use crate::storage;
 use crate::syntax;
 use eframe::egui;
@@ -21,6 +22,8 @@ enum RequestTab {
     Params,
     Headers,
     Body,
+    PreRequestScript,
+    TestsScript,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -28,6 +31,7 @@ enum ResponseTab {
     Body,
     Headers,
     Request,
+    TestResults,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +79,14 @@ pub struct App {
     sent_request: Option<SentRequest>,
     auto_format_response: bool,
 
+    /// `console.log` output from the current request's pre-request and
+    /// post-response Lua scripts, in the order the two phases ran.
+    script_log: Vec<String>,
+    /// The most recent script error (pre-request or post-response), if any.
+    script_error: Option<String>,
+    /// `pm.test(...)` results from the post-response script.
+    test_results: Vec<TestResult>,
+
     new_collection_name: String,
     new_environment_name: String,
 
@@ -93,6 +105,14 @@ pub struct App {
     /// Find-in-body text for the request/response body viewers.
     request_body_find: String,
     response_body_find: String,
+
+    /// Window size as of last frame, to detect an active resize drag.
+    last_screen_size: Option<egui::Vec2>,
+    /// While in the future, treat the window as still being actively resized
+    /// (reset a bit further out on every size change) so body text editors
+    /// can freeze their wrap width instead of re-laying-out huge bodies on
+    /// every single intermediate frame of the drag.
+    resize_settle_deadline: Option<std::time::Instant>,
 }
 
 impl App {
@@ -127,6 +147,9 @@ impl App {
             response_error: None,
             sent_request: None,
             auto_format_response: true,
+            script_log: Vec::new(),
+            script_error: None,
+            test_results: Vec::new(),
             new_collection_name: String::new(),
             new_environment_name: String::new(),
             autosave_last_synced: None,
@@ -136,6 +159,8 @@ impl App {
             search_needs_focus: false,
             request_body_find: String::new(),
             response_body_find: String::new(),
+            last_screen_size: None,
+            resize_settle_deadline: None,
         }
     }
 
@@ -156,6 +181,22 @@ impl App {
             self.is_loading = false;
             match outcome {
                 RequestOutcome::Success { request, response } => {
+                    let mut env = self.active_env();
+                    let post = scripting::run_post_response(
+                        &self.current_request,
+                        &mut env,
+                        Some(&response),
+                        None,
+                    );
+                    self.script_log.extend(post.log);
+                    if post.error.is_some() {
+                        self.script_error = post.error;
+                    }
+                    self.test_results = post.tests;
+                    if let Some(env) = &env {
+                        self.persist_environment(env);
+                    }
+
                     let entry = HistoryEntry {
                         id: Uuid::new_v4(),
                         timestamp: chrono::Utc::now(),
@@ -163,6 +204,11 @@ impl App {
                         url: self.current_request.url.clone(),
                         status: Some(response.status),
                         request: self.current_request.clone(),
+                        sent_request: Some(request.clone()),
+                        duration_ms: Some(response.duration_ms),
+                        response: Some(response.clone()),
+                        error: None,
+                        test_results: self.test_results.clone(),
                     };
                     self.data.history.insert(0, entry);
                     self.data.history.truncate(200);
@@ -171,10 +217,42 @@ impl App {
                     self.response_error = None;
                     self.save();
                 }
-                RequestOutcome::Error { request, message } => {
+                RequestOutcome::Error { request, message, duration_ms } => {
+                    let mut env = self.active_env();
+                    let post = scripting::run_post_response(
+                        &self.current_request,
+                        &mut env,
+                        None,
+                        Some(&message),
+                    );
+                    self.script_log.extend(post.log);
+                    if post.error.is_some() {
+                        self.script_error = post.error;
+                    }
+                    self.test_results = post.tests;
+                    if let Some(env) = &env {
+                        self.persist_environment(env);
+                    }
+
+                    let entry = HistoryEntry {
+                        id: Uuid::new_v4(),
+                        timestamp: chrono::Utc::now(),
+                        method: self.current_request.method,
+                        url: self.current_request.url.clone(),
+                        status: None,
+                        request: self.current_request.clone(),
+                        sent_request: request.clone(),
+                        duration_ms,
+                        response: None,
+                        error: Some(message.clone()),
+                        test_results: self.test_results.clone(),
+                    };
+                    self.data.history.insert(0, entry);
+                    self.data.history.truncate(200);
                     self.sent_request = request;
                     self.response = None;
                     self.response_error = Some(message);
+                    self.save();
                 }
             }
         }
@@ -190,16 +268,45 @@ impl App {
         self.response = None;
         self.response_error = None;
         self.sent_request = None;
+        self.script_log.clear();
+        self.script_error = None;
+        self.test_results.clear();
+
+        let mut item = self.current_request.clone();
+        let mut env = self.active_env();
+        let pre = scripting::run_pre_request(&mut item, &mut env);
+        self.script_log.extend(pre.log);
+        self.script_error = pre.error;
+        if let Some(env) = &env {
+            self.persist_environment(env);
+        }
+        // A broken pre-request script (syntax error, uncaught Lua error)
+        // means the request may be missing headers/auth it was meant to set
+        // up — don't send it half-configured, matching Postman's behavior.
+        if self.script_error.is_some() {
+            self.is_loading = false;
+            return;
+        }
 
         let client = self.client.clone();
-        let item = self.current_request.clone();
-        let env = self.active_env();
         let tx = self.tx.clone();
 
         self.rt.spawn(async move {
             let outcome = http_client::send_request(client, item, env).await;
             let _ = tx.send((id, outcome));
         });
+    }
+
+    /// Writes environment variables that a pre-request/post-response script
+    /// changed via `pm.environment.set(...)` back into the persisted
+    /// environment, so later requests (and a future app launch) see them.
+    fn persist_environment(&mut self, env: &Environment) {
+        if let Some(existing) = self.data.environments.iter_mut().find(|e| e.id == env.id) {
+            if existing.variables != env.variables {
+                existing.variables = env.variables.clone();
+                self.save();
+            }
+        }
     }
 
     // ---------- UI: top bar ----------
@@ -213,8 +320,8 @@ impl App {
                     .active_env()
                     .map(|e| e.name)
                     .unwrap_or_else(|| "No Environment".to_string());
-                egui::ComboBox::from_id_salt("active_env_combo")
-                    .selected_text(current_name)
+                let env_combo = egui::ComboBox::from_id_salt("active_env_combo")
+                    .selected_text(current_name.as_str())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.active_environment, None, "No Environment");
                         for env in &self.data.environments {
@@ -225,6 +332,13 @@ impl App {
                             );
                         }
                     });
+                env_combo.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::ComboBox,
+                        true,
+                        format!("Active environment: {current_name}"),
+                    )
+                });
 
                 ui.separator();
                 let (icon, tooltip) = match self.split_direction {
@@ -308,13 +422,20 @@ impl App {
                             collection.folders.push(Folder::new("New Folder"));
                             save_needed = true;
                         }
-                        if ui.small_button("🗑").on_hover_text("Delete collection").clicked() {
+                        if icon_button(ui, "🗑", "Delete collection").clicked() {
                             delete_collection = Some(collection_id);
                         }
                     });
 
-                    for req in &mut collection.requests {
+                    for (i, req) in collection.requests.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
+                            // The first 9 requests directly under "Saved
+                            // Requests" are reachable via Option/Alt+1..9
+                            // (see `open_saved_request`); number them so
+                            // that shortcut is discoverable.
+                            if collection.name == "Saved Requests" && i < 9 {
+                                ui.weak(format!("{}", i + 1));
+                            }
                             ui.label(req.method.as_str());
                             if ui
                                 .selectable_label(req.id == focused_id, &req.name)
@@ -356,21 +477,46 @@ impl App {
             save_needed = true;
         }
         if let Some((collection, folder, req)) = load_request {
-            self.current_request = req.clone();
-            self.origin = RequestOrigin::Collection {
-                collection,
-                folder,
-                request: req.id,
-            };
-            self.central_view = CentralView::Request;
-            self.response = None;
-            self.response_error = None;
-            self.sent_request = None;
-            self.autosave_last_synced = Some(self.current_request.clone());
+            self.load_request_into_editor(collection, folder, req);
         }
         if save_needed {
             self.save();
         }
+    }
+
+    /// Loads `req` into the request editor, replacing whatever is currently
+    /// open. Shared by sidebar clicks and the Option/Alt+1..9 shortcut.
+    fn load_request_into_editor(&mut self, collection: Uuid, folder: Option<Uuid>, req: RequestItem) {
+        self.current_request = req.clone();
+        self.origin = RequestOrigin::Collection {
+            collection,
+            folder,
+            request: req.id,
+        };
+        self.central_view = CentralView::Request;
+        self.response = None;
+        self.response_error = None;
+        self.sent_request = None;
+        self.autosave_last_synced = Some(self.current_request.clone());
+    }
+
+    /// Opens the (0-indexed) Nth request directly under the default "Saved
+    /// Requests" collection — bound to Option/Alt+1..9 in the main update
+    /// loop. A no-op if that collection or request slot doesn't exist.
+    fn open_saved_request(&mut self, index: usize) {
+        let Some(collection) = self
+            .data
+            .collections
+            .iter()
+            .find(|c| c.name == "Saved Requests")
+        else {
+            return;
+        };
+        let Some(req) = collection.requests.get(index).cloned() else {
+            return;
+        };
+        let collection_id = collection.id;
+        self.load_request_into_editor(collection_id, None, req);
     }
 
     fn environments_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -406,10 +552,14 @@ impl App {
                 if ui.selectable_label(is_active, &env.name).clicked() {
                     self.active_environment = Some(env.id);
                 }
-                if ui.small_button("edit").clicked() {
+                if ui
+                    .small_button("edit")
+                    .on_hover_text(format!("Edit {}", env.name))
+                    .clicked()
+                {
                     self.central_view = CentralView::EnvironmentEditor(env.id);
                 }
-                if ui.small_button("🗑").clicked() {
+                if icon_button(ui, "🗑", &format!("Delete {}", env.name)).clicked() {
                     delete_env = Some(env.id);
                 }
             });
@@ -429,24 +579,39 @@ impl App {
             self.save();
         }
         ui.separator();
-        let mut load: Option<RequestItem> = None;
-        for entry in &self.data.history {
-            let status = entry
-                .status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let label = format!("{} {} [{}]", entry.method.as_str(), entry.url, status);
+        let mut load: Option<usize> = None;
+        for (i, entry) in self.data.history.iter().enumerate() {
+            let status = match (entry.status, &entry.error) {
+                (Some(status), _) => status.to_string(),
+                (None, Some(_)) => "ERROR".to_string(),
+                (None, None) => "-".to_string(),
+            };
+            let duration = entry
+                .duration_ms
+                .map(|ms| format!(" {ms}ms"))
+                .unwrap_or_default();
+            let label = format!(
+                "{} {} [{}]{}",
+                entry.method.as_str(),
+                entry.url,
+                status,
+                duration
+            );
             if ui.selectable_label(false, label).clicked() {
-                load = Some(entry.request.clone());
+                load = Some(i);
             }
         }
-        if let Some(req) = load {
-            self.current_request = req;
+        // Restores both the request definition *and* the exact response
+        // that was received at the time, so a history entry is a full
+        // replay of what happened — not just a template to resend.
+        if let Some(i) = load {
+            let entry = self.data.history[i].clone();
+            self.current_request = entry.request;
             self.origin = RequestOrigin::Unsaved;
             self.central_view = CentralView::Request;
-            self.response = None;
-            self.response_error = None;
-            self.sent_request = None;
+            self.response = entry.response;
+            self.response_error = entry.error;
+            self.sent_request = entry.sent_request;
             self.autosave_last_synced = None;
             self.autosave_last_saved_at = None;
         }
@@ -614,6 +779,12 @@ impl App {
             ui.selectable_value(&mut self.request_tab, RequestTab::Params, "Params");
             ui.selectable_value(&mut self.request_tab, RequestTab::Headers, "Headers");
             ui.selectable_value(&mut self.request_tab, RequestTab::Body, "Body");
+            ui.selectable_value(
+                &mut self.request_tab,
+                RequestTab::PreRequestScript,
+                "Pre-request Script",
+            );
+            ui.selectable_value(&mut self.request_tab, RequestTab::TestsScript, "Tests");
         });
         ui.separator();
 
@@ -634,8 +805,13 @@ impl App {
                         ui.selectable_value(&mut body.mode, BodyMode::Json, "JSON");
                         ui.selectable_value(&mut body.mode, BodyMode::Raw, "Raw");
                         ui.selectable_value(&mut body.mode, BodyMode::Form, "Form");
+                        ui.selectable_value(&mut body.mode, BodyMode::Multipart, "Form-data");
+                        ui.selectable_value(&mut body.mode, BodyMode::Binary, "Binary");
                     });
-                    if !matches!(body.mode, BodyMode::None | BodyMode::Form) {
+                    if !matches!(
+                        body.mode,
+                        BodyMode::None | BodyMode::Form | BodyMode::Multipart | BodyMode::Binary
+                    ) {
                         ui.horizontal(|ui| {
                             ui.label("Find:");
                             ui.add(
@@ -661,8 +837,17 @@ impl App {
                             let dark = ui.visuals().dark_mode;
                             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
                             let search_query = self.request_body_find.clone();
+                            let freeze_wrap = self
+                                .resize_settle_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() < deadline);
                             let mut layouter =
                                 move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                    let wrap_width = effective_wrap_width(
+                                        ui.ctx(),
+                                        egui::Id::new("request_body_wrap"),
+                                        wrap_width,
+                                        freeze_wrap,
+                                    );
                                     let mut job = syntax::highlight_cached(
                                         ui.ctx(),
                                         egui::Id::new("request_body_highlight"),
@@ -686,7 +871,21 @@ impl App {
                         BodyMode::Form => {
                             key_value_table(ui, "form_table", &mut body.form);
                         }
+                        BodyMode::Multipart => {
+                            multipart_form_table(ui, "multipart_table", &mut body.multipart);
+                        }
+                        BodyMode::Binary => {
+                            binary_body_picker(ui, &mut body.binary_file_path);
+                        }
                     }
+                }
+                RequestTab::PreRequestScript => {
+                    ui.label("Runs before the request is sent. Available: pm.environment.get/set(key, value), pm.request.url/method/body, pm.request:getHeader/setHeader(key, value), console.log(...).");
+                    script_editor(ui, "pre_request_script_editor", &mut self.current_request.pre_request_script);
+                }
+                RequestTab::TestsScript => {
+                    ui.label("Runs after the response arrives. Available: pm.response.status/body/duration_ms/error, pm.response:getHeader(key), pm.response:json(), pm.environment.get/set(key, value), pm.test(name, function() ... end), console.log(...).");
+                    script_editor(ui, "tests_script_editor", &mut self.current_request.post_response_script);
                 }
             });
     }
@@ -780,7 +979,12 @@ impl App {
     }
 
     fn response_viewer(&mut self, ui: &mut egui::Ui) {
-        if self.response.is_none() && self.response_error.is_none() && self.sent_request.is_none() {
+        if self.response.is_none()
+            && self.response_error.is_none()
+            && self.sent_request.is_none()
+            && self.script_error.is_none()
+            && self.script_log.is_empty()
+        {
             ui.weak("Send a request to see the response here.");
             return;
         }
@@ -807,6 +1011,14 @@ impl App {
             ui.selectable_value(&mut self.response_tab, ResponseTab::Body, "Body");
             ui.selectable_value(&mut self.response_tab, ResponseTab::Headers, "Headers");
             ui.selectable_value(&mut self.response_tab, ResponseTab::Request, "Request");
+            let passed = self.test_results.iter().filter(|t| t.passed).count();
+            let total = self.test_results.len();
+            let tests_label = if total > 0 {
+                format!("Tests ({passed}/{total})")
+            } else {
+                "Tests".to_string()
+            };
+            ui.selectable_value(&mut self.response_tab, ResponseTab::TestResults, tests_label);
             if self.response_tab == ResponseTab::Body {
                 ui.add_space(12.0);
                 ui.checkbox(&mut self.auto_format_response, "Auto format")
@@ -851,8 +1063,17 @@ impl App {
                     let dark = ui.visuals().dark_mode;
                     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
                     let search_query = self.response_body_find.clone();
+                    let freeze_wrap = self
+                                .resize_settle_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() < deadline);
                     let mut layouter =
                         move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let wrap_width = effective_wrap_width(
+                                ui.ctx(),
+                                egui::Id::new("response_body_wrap"),
+                                wrap_width,
+                                freeze_wrap,
+                            );
                             let mut job = syntax::highlight_cached(
                                 ui.ctx(),
                                 egui::Id::new("response_body_highlight"),
@@ -919,8 +1140,17 @@ impl App {
                         };
                         let dark = ui.visuals().dark_mode;
                         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                        let freeze_wrap = self
+                                .resize_settle_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() < deadline);
                         let mut layouter =
                             move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                let wrap_width = effective_wrap_width(
+                                    ui.ctx(),
+                                    egui::Id::new("sent_request_body_wrap"),
+                                    wrap_width,
+                                    freeze_wrap,
+                                );
                                 let mut job = syntax::highlight_cached(
                                     ui.ctx(),
                                     egui::Id::new("sent_request_body_highlight"),
@@ -939,6 +1169,36 @@ impl App {
                             .desired_width(f32::INFINITY)
                             .layouter(&mut layouter);
                         show_code_editor_with_links(ui, body, text_edit);
+                    }
+                }
+                ResponseTab::TestResults => {
+                    if let Some(err) = &self.script_error {
+                        ui.colored_label(egui::Color32::RED, format!("Script error: {err}"));
+                        ui.add_space(8.0);
+                    }
+                    if self.test_results.is_empty() {
+                        ui.weak("No pm.test(...) assertions in the post-response script.");
+                    } else {
+                        for test in &self.test_results {
+                            ui.horizontal(|ui| {
+                                if test.passed {
+                                    ui.colored_label(egui::Color32::GREEN, "✔");
+                                } else {
+                                    ui.colored_label(egui::Color32::RED, "✘");
+                                }
+                                ui.label(&test.name);
+                            });
+                            if let Some(err) = &test.error {
+                                ui.colored_label(egui::Color32::RED, format!("    {err}"));
+                            }
+                        }
+                    }
+                    if !self.script_log.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label("console.log output:");
+                        for line in &self.script_log {
+                            ui.monospace(line);
+                        }
                     }
                 }
             });
@@ -1122,6 +1382,21 @@ fn path_params_editor(ui: &mut egui::Ui, url: &str, path_params: &mut Vec<KeyVal
 }
 
 /// `query` must already be lowercased; empty matches everything.
+/// While `freeze` is true, ignores `wrap_width` and keeps returning whatever
+/// width was last recorded under `id` instead — so a body's syntax-highlight
+/// layout job stays byte-for-byte identical frame to frame during an active
+/// window resize (same text, same wrap width) and egui's own galley cache
+/// can just reuse the previous result instead of re-shaping the whole body
+/// on every single intermediate frame of the drag. Once `freeze` goes back
+/// to false, the real (now-settled) width is adopted again.
+fn effective_wrap_width(ctx: &egui::Context, id: egui::Id, wrap_width: f32, freeze: bool) -> f32 {
+    if freeze && let Some(frozen) = ctx.data_mut(|d| d.get_temp::<f32>(id)) {
+        return frozen;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, wrap_width));
+    wrap_width
+}
+
 fn request_matches_query(item: &RequestItem, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -1129,6 +1404,32 @@ fn request_matches_query(item: &RequestItem, query: &str) -> bool {
     item.name.to_lowercase().contains(query)
         || item.url.to_lowercase().contains(query)
         || item.method.as_str().to_lowercase().contains(query)
+}
+
+/// A plain monospace multiline editor for Lua scripts. No syntax
+/// highlighting (`syntax.rs` only knows JSON/HTML/plain text) — good enough
+/// for a first pass at pre-request/post-response scripting.
+fn script_editor(ui: &mut egui::Ui, id_salt: &str, script: &mut String) {
+    ui.push_id(id_salt, |ui| {
+        ui.add(
+            egui::TextEdit::multiline(script)
+                .code_editor()
+                .desired_rows(12)
+                .desired_width(f32::INFINITY),
+        );
+    });
+}
+
+/// An icon-only button (e.g. a "🗑" delete glyph) with a real accessible
+/// name: without this, a screen reader has nothing to announce it by but the
+/// raw emoji character, since egui derives a button's accessibility label
+/// from its visible text by default.
+fn icon_button(ui: &mut egui::Ui, icon: &str, accessible_label: &str) -> egui::Response {
+    let response = ui.small_button(icon).on_hover_text(accessible_label);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label)
+    });
+    response
 }
 
 fn key_value_table(ui: &mut egui::Ui, id_salt: &str, items: &mut Vec<KeyValue>) {
@@ -1155,10 +1456,23 @@ fn key_value_table(ui: &mut egui::Ui, id_salt: &str, items: &mut Vec<KeyValue>) 
     for (i, kv) in items.iter_mut().enumerate() {
         ui.push_id((id_salt, i), |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut kv.enabled, "");
+                let row_label = if kv.key.is_empty() {
+                    format!("row {}", i + 1)
+                } else {
+                    kv.key.clone()
+                };
+                let checkbox = ui.checkbox(&mut kv.enabled, "");
+                checkbox.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        true,
+                        kv.enabled,
+                        format!("Enable {row_label}"),
+                    )
+                });
                 ui.add(egui::TextEdit::singleline(&mut kv.key).desired_width(key_width));
                 ui.add(egui::TextEdit::singleline(&mut kv.value).desired_width(value_width));
-                if ui.small_button("🗑").clicked() {
+                if icon_button(ui, "🗑", &format!("Remove {row_label}")).clicked() {
                     remove_idx = Some(i);
                 }
             });
@@ -1172,15 +1486,153 @@ fn key_value_table(ui: &mut egui::Ui, id_salt: &str, items: &mut Vec<KeyValue>) 
     }
 }
 
+/// Like `key_value_table`, but each row also carries a Text/File toggle for
+/// `multipart/form-data` bodies. A `File` row shows a native file picker
+/// instead of a value text field.
+fn multipart_form_table(ui: &mut egui::Ui, id_salt: &str, items: &mut Vec<FormField>) {
+    let mut remove_idx: Option<usize> = None;
+    let total_width = ui.available_width();
+    let overhead = 190.0;
+    let usable = (total_width - overhead).max(0.0);
+    let key_width = usable * 0.35;
+    let value_width = usable * 0.65;
+    for (i, field) in items.iter_mut().enumerate() {
+        ui.push_id((id_salt, i), |ui| {
+            ui.horizontal(|ui| {
+                let row_label = if field.key.is_empty() {
+                    format!("row {}", i + 1)
+                } else {
+                    field.key.clone()
+                };
+                let checkbox = ui.checkbox(&mut field.enabled, "");
+                checkbox.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        true,
+                        field.enabled,
+                        format!("Enable {row_label}"),
+                    )
+                });
+                ui.add(egui::TextEdit::singleline(&mut field.key).desired_width(key_width));
+                let type_combo = egui::ComboBox::from_id_salt((id_salt, i, "type"))
+                    .selected_text(match field.field_type {
+                        FormFieldType::Text => "Text",
+                        FormFieldType::File => "File",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut field.field_type, FormFieldType::Text, "Text");
+                        ui.selectable_value(&mut field.field_type, FormFieldType::File, "File");
+                    });
+                type_combo.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::ComboBox,
+                        true,
+                        format!(
+                            "Field type for {row_label}: {}",
+                            match field.field_type {
+                                FormFieldType::Text => "Text",
+                                FormFieldType::File => "File",
+                            }
+                        ),
+                    )
+                });
+                match field.field_type {
+                    FormFieldType::Text => {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut field.value).desired_width(value_width),
+                        );
+                    }
+                    FormFieldType::File => {
+                        if ui
+                            .button("Choose file…")
+                            .on_hover_text(format!("Choose a file for {row_label}"))
+                            .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                field.file_path = Some(path.display().to_string());
+                            }
+                        }
+                        let label = field
+                            .file_path
+                            .as_deref()
+                            .unwrap_or("No file selected");
+                        ui.add(egui::Label::new(label).truncate());
+                    }
+                }
+                if icon_button(ui, "🗑", &format!("Remove {row_label}")).clicked() {
+                    remove_idx = Some(i);
+                }
+            });
+        });
+    }
+    if ui.button("+ Add").clicked() {
+        items.push(FormField::new());
+    }
+    if let Some(i) = remove_idx {
+        items.remove(i);
+    }
+}
+
+/// File picker for `BodyMode::Binary`: the whole request body is the chosen
+/// file's raw bytes.
+fn binary_body_picker(ui: &mut egui::Ui, path: &mut Option<String>) {
+    ui.horizontal(|ui| {
+        if ui.button("Choose file…").clicked() {
+            if let Some(picked) = rfd::FileDialog::new().pick_file() {
+                *path = Some(picked.display().to_string());
+            }
+        }
+        match path {
+            Some(p) => {
+                ui.label(p.as_str());
+                if icon_button(ui, "🗑", "Clear selected file").clicked() {
+                    *path = None;
+                }
+            }
+            None => {
+                ui.weak("No file selected");
+            }
+        }
+    });
+    if path.is_some() {
+        ui.weak("The file's contents are sent as-is as the request body.");
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_responses(ui.ctx());
         self.autosave_if_dirty();
+
+        let screen_size = ui.ctx().content_rect().size();
+        if self.last_screen_size != Some(screen_size) {
+            self.last_screen_size = Some(screen_size);
+            let settle = std::time::Duration::from_millis(200);
+            self.resize_settle_deadline = Some(std::time::Instant::now() + settle);
+            ui.ctx().request_repaint_after(settle);
+        }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Space)) {
             self.search_open = !self.search_open;
             if self.search_open {
                 self.search_query.clear();
                 self.search_needs_focus = true;
+            }
+        }
+        const NUMBER_KEYS: [egui::Key; 9] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        for (i, key) in NUMBER_KEYS.into_iter().enumerate() {
+            if ui.input_mut(|inp| inp.consume_key(egui::Modifiers::ALT, key)) {
+                self.open_saved_request(i);
+                break;
             }
         }
         self.top_bar(ui);

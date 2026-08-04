@@ -71,6 +71,10 @@ pub enum BodyMode {
     Raw,
     Json,
     Form,
+    /// `multipart/form-data`: a mix of plain text fields and file attachments.
+    Multipart,
+    /// A single file sent as the entire request body.
+    Binary,
 }
 
 impl Default for BodyMode {
@@ -79,11 +83,45 @@ impl Default for BodyMode {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormFieldType {
+    #[default]
+    Text,
+    File,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FormField {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+    pub field_type: FormFieldType,
+    /// Populated (via the native file picker) when `field_type` is `File`.
+    pub file_path: Option<String>,
+}
+
+impl FormField {
+    pub fn new() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            enabled: true,
+            field_type: FormFieldType::Text,
+            file_path: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct RequestBody {
     pub mode: BodyMode,
     pub raw: String,
     pub form: Vec<KeyValue>,
+    #[serde(default)]
+    pub multipart: Vec<FormField>,
+    /// Selected file path for `BodyMode::Binary`.
+    #[serde(default)]
+    pub binary_file_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -100,6 +138,16 @@ pub struct RequestItem {
     /// text by the UI; absent in JSON saved before this feature existed.
     #[serde(default)]
     pub path_params: Vec<KeyValue>,
+    /// Lua script run before the request is sent; can rewrite the URL,
+    /// method, headers, and (raw/JSON) body, and read/write environment
+    /// variables via the `pm` table.
+    #[serde(default)]
+    pub pre_request_script: String,
+    /// Lua script run after the response is received (or the request
+    /// failed); can inspect `pm.response`, write environment variables, and
+    /// record pass/fail assertions via `pm.test(name, fn)`.
+    #[serde(default)]
+    pub post_response_script: String,
 }
 
 impl RequestItem {
@@ -113,6 +161,8 @@ impl RequestItem {
             headers: vec![],
             body: RequestBody::default(),
             path_params: vec![],
+            pre_request_script: String::new(),
+            post_response_script: String::new(),
         }
     }
 }
@@ -224,6 +274,15 @@ impl Environment {
     }
 }
 
+/// A single `pm.test(name, fn)` assertion from a post-response script: `fn`
+/// ran without raising an error (`passed`), or `error` holds what it raised.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TestResult {
+    pub name: String,
+    pub passed: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HistoryEntry {
     pub id: Uuid,
@@ -231,7 +290,28 @@ pub struct HistoryEntry {
     pub method: Method,
     pub url: String,
     pub status: Option<u16>,
+    /// The request's definition as edited (unresolved `{{variable}}`
+    /// placeholders) — reloaded into the editor when this entry is clicked.
     pub request: RequestItem,
+    /// The fully-resolved request actually sent on the wire. Absent in
+    /// history saved before this field existed.
+    #[serde(default)]
+    pub sent_request: Option<crate::http_client::SentRequest>,
+    /// The full response received, when the request succeeded.
+    #[serde(default)]
+    pub response: Option<crate::http_client::HttpResponse>,
+    /// The error message, when the request failed instead of completing.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// How long the request was in flight, whether it succeeded or failed.
+    /// `None` on failures that happened before anything was sent (e.g. an
+    /// empty URL).
+    #[serde(default)]
+    pub duration_ms: Option<u128>,
+    /// Results of any `pm.test(...)` assertions from the post-response
+    /// script that ran for this entry.
+    #[serde(default)]
+    pub test_results: Vec<TestResult>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

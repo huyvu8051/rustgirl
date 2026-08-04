@@ -1,7 +1,8 @@
-use crate::model::{BodyMode, Environment, RequestItem};
+use crate::model::{BodyMode, Environment, FormFieldType, RequestItem};
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpResponse {
     pub status: u16,
     pub status_text: String,
@@ -15,7 +16,7 @@ pub struct HttpResponse {
 /// (including query string), every header actually sent, and the raw body —
 /// all *after* `{{variable}}` substitution, so it reflects reality rather than
 /// what the editor fields say.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentRequest {
     pub method: String,
     pub url: String,
@@ -31,6 +32,10 @@ pub enum RequestOutcome {
     Error {
         request: Option<SentRequest>,
         message: String,
+        /// How long the request was in flight before failing. `None` when
+        /// the failure happened before anything was sent on the wire (e.g.
+        /// an empty URL, a missing file, or a request that failed to build).
+        duration_ms: Option<u128>,
     },
 }
 
@@ -76,6 +81,7 @@ pub async fn send_request(
         return RequestOutcome::Error {
             request: None,
             message: "URL is empty".to_string(),
+            duration_ms: None,
         };
     }
 
@@ -119,6 +125,71 @@ pub async fn send_request(
                 .collect();
             req = req.form(&form);
         }
+        BodyMode::Multipart => {
+            let mut form = reqwest::multipart::Form::new();
+            for field in item
+                .body
+                .multipart
+                .iter()
+                .filter(|f| f.enabled && !f.key.is_empty())
+            {
+                let key = resolve(&field.key);
+                match field.field_type {
+                    FormFieldType::Text => {
+                        form = form.text(key, resolve(&field.value));
+                    }
+                    FormFieldType::File => {
+                        let Some(path) = field.file_path.as_ref().filter(|p| !p.is_empty()) else {
+                            continue;
+                        };
+                        match tokio::fs::read(path).await {
+                            Ok(bytes) => {
+                                let file_name = std::path::Path::new(path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "file".to_string());
+                                let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+                                form = form.part(key, part);
+                            }
+                            Err(e) => {
+                                return RequestOutcome::Error {
+                                    request: None,
+                                    message: format!("Failed to read file {path}: {e}"),
+                                    duration_ms: None,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            req = req.multipart(form);
+        }
+        BodyMode::Binary => {
+            let Some(path) = item
+                .body
+                .binary_file_path
+                .as_ref()
+                .filter(|p| !p.is_empty())
+            else {
+                return RequestOutcome::Error {
+                    request: None,
+                    message: "No file selected for the binary body".to_string(),
+                    duration_ms: None,
+                };
+            };
+            match tokio::fs::read(path).await {
+                Ok(bytes) => {
+                    req = req.body(bytes);
+                }
+                Err(e) => {
+                    return RequestOutcome::Error {
+                        request: None,
+                        message: format!("Failed to read file {path}: {e}"),
+                        duration_ms: None,
+                    };
+                }
+            }
+        }
     }
 
     let built = match req.build() {
@@ -127,6 +198,7 @@ pub async fn send_request(
             return RequestOutcome::Error {
                 request: None,
                 message: format!("Failed to build request: {e}"),
+                duration_ms: None,
             };
         }
     };
@@ -167,12 +239,14 @@ pub async fn send_request(
                 Err(e) => RequestOutcome::Error {
                     request: Some(snapshot),
                     message: format!("Failed to read body: {e}"),
+                    duration_ms: Some(duration_ms),
                 },
             }
         }
         Err(e) => RequestOutcome::Error {
             request: Some(snapshot),
             message: format!("Request failed: {e}"),
+            duration_ms: Some(duration_ms),
         },
     }
 }

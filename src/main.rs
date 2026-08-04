@@ -1,6 +1,7 @@
 mod app;
 mod http_client;
 mod model;
+mod scripting;
 mod storage;
 mod syntax;
 
