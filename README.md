@@ -1,5 +1,9 @@
 # RustGirl
 
+[![License: MIT](https://img.shields.io/github/license/huyvu8051/rustgirl)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-informational)](#getting-started)
+
 A Postman-style HTTP client desktop app, built entirely in Rust with [egui](https://github.com/emilk/egui)/[eframe](https://github.com/emilk/egui/tree/master/crates/eframe). Native, no Electron/webview — a single small binary that runs on macOS, Windows, and Linux.
 
 ## Features
@@ -22,13 +26,42 @@ A Postman-style HTTP client desktop app, built entirely in Rust with [egui](http
 
 Requires Rust 1.85+ (edition 2024).
 
+### Install Rust
+
+If you don't already have Rust, install it via [rustup](https://rustup.rs):
+
+**macOS / Linux**
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**Windows**
+
+Download and run [`rustup-init.exe`](https://win.rustup.rs), or via winget:
+
+```powershell
+winget install Rustlang.Rustup
+```
+
+Restart your terminal, then verify the install:
+
+```bash
+rustc --version   # should print 1.85.0 or later
+cargo --version
+```
+
+Already have Rust but on an older version? Update it with `rustup update`.
+
+### Build & run
+
 ```bash
 git clone https://github.com/huyvu8051/rustgirl.git
 cd rustgirl
 cargo run --release
 ```
 
-The Lua interpreter is vendored and built from source by `mlua`, so no system Lua install is required.
+The Lua interpreter is vendored and built from source by `mlua`, so no system Lua install is required. On Linux you'll need a C compiler toolchain (`build-essential` on Debian/Ubuntu, or the equivalent for your distro) for `mlua`'s vendored build.
 
 ## Tech stack
 
