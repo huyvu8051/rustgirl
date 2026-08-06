@@ -1,6 +1,11 @@
 mod app;
+mod auth;
+mod codegen;
+mod curl_import;
 mod http_client;
 mod model;
+mod openapi_import;
+mod postman_format;
 mod scripting;
 mod storage;
 mod syntax;

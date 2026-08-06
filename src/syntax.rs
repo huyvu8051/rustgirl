@@ -50,7 +50,10 @@ pub fn detect_links(text: &str) -> Vec<std::ops::Range<usize>> {
             let mut j = i;
             while j < text.len()
                 && !bytes[j].is_ascii_whitespace()
-                && !matches!(bytes[j], b'"' | b'\'' | b'<' | b'>' | b',' | b')' | b']' | b'}')
+                && !matches!(
+                    bytes[j],
+                    b'"' | b'\'' | b'<' | b'>' | b',' | b')' | b']' | b'}'
+                )
             {
                 j += 1;
             }
@@ -163,7 +166,16 @@ pub fn highlight(
         Language::Markup => highlight_markup(&palette, &font_id, text, &links, &matches),
         Language::Plain => {
             let mut job = LayoutJob::default();
-            push(&mut job, text, 0..text.len(), &font_id, palette.plain, &links, &matches, &palette);
+            push(
+                &mut job,
+                text,
+                0..text.len(),
+                &font_id,
+                palette.plain,
+                &links,
+                &matches,
+                &palette,
+            );
             job
         }
     }
@@ -267,7 +279,16 @@ fn push(
     }
     split_by_markers(range, links, |sub_range, is_link| {
         split_by_markers(sub_range, search_matches, |final_range, is_match| {
-            append_span(job, text, final_range, font_id, color, is_link, is_match, palette);
+            append_span(
+                job,
+                text,
+                final_range,
+                font_id,
+                color,
+                is_link,
+                is_match,
+                palette,
+            );
         });
     });
 }
@@ -320,7 +341,16 @@ fn highlight_json(
             while j < chars.len() && chars[j].1.is_whitespace() {
                 j += 1;
             }
-            push(&mut job, text, start..byte_at(j), font_id, palette.plain, links, matches, palette);
+            push(
+                &mut job,
+                text,
+                start..byte_at(j),
+                font_id,
+                palette.plain,
+                links,
+                matches,
+                palette,
+            );
             i = j;
         } else if c == '"' {
             let mut j = i + 1;
@@ -358,7 +388,16 @@ fn highlight_json(
             while j < chars.len() && matches!(chars[j].1, '0'..='9' | '.' | 'e' | 'E' | '+' | '-') {
                 j += 1;
             }
-            push(&mut job, text, start..byte_at(j), font_id, palette.number, links, matches, palette);
+            push(
+                &mut job,
+                text,
+                start..byte_at(j),
+                font_id,
+                palette.number,
+                links,
+                matches,
+                palette,
+            );
             i = j;
         } else if c.is_alphabetic() {
             let mut j = i + 1;
@@ -372,7 +411,16 @@ fn highlight_json(
             } else {
                 palette.plain
             };
-            push(&mut job, text, start..end, font_id, color, links, matches, palette);
+            push(
+                &mut job,
+                text,
+                start..end,
+                font_id,
+                color,
+                links,
+                matches,
+                palette,
+            );
             i = j;
         } else if "{}[]:,".contains(c) {
             push(
@@ -416,7 +464,16 @@ fn highlight_markup(
     while i < len {
         if text[i..].starts_with("<!--") {
             let end = text[i..].find("-->").map_or(len, |p| i + p + 3);
-            push(&mut job, text, i..end, font_id, palette.comment, links, matches, palette);
+            push(
+                &mut job,
+                text,
+                i..end,
+                font_id,
+                palette.comment,
+                links,
+                matches,
+                palette,
+            );
             i = end;
         } else if text.as_bytes()[i] == b'<' {
             let tag_end = text[i..].find('>').map_or(len, |p| i + p + 1);
@@ -424,7 +481,16 @@ fn highlight_markup(
             i = tag_end;
         } else {
             let next_lt = text[i..].find('<').map_or(len, |p| i + p);
-            push(&mut job, text, i..next_lt, font_id, palette.plain, links, matches, palette);
+            push(
+                &mut job,
+                text,
+                i..next_lt,
+                font_id,
+                palette.plain,
+                links,
+                matches,
+                palette,
+            );
             i = next_lt;
         }
     }
@@ -453,32 +519,77 @@ fn highlight_tag(
     if bytes.get(j) == Some(&b'/') {
         j += 1;
     }
-    push(job, text, i..j, font_id, palette.punctuation, links, matches, palette);
+    push(
+        job,
+        text,
+        i..j,
+        font_id,
+        palette.punctuation,
+        links,
+        matches,
+        palette,
+    );
     i = j;
 
     let name_start = i;
     while i < end && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/' {
         i += 1;
     }
-    push(job, text, name_start..i, font_id, palette.tag, links, matches, palette);
+    push(
+        job,
+        text,
+        name_start..i,
+        font_id,
+        palette.tag,
+        links,
+        matches,
+        palette,
+    );
 
     while i < end {
         let ws_start = i;
         while i < end && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        push(job, text, ws_start..i, font_id, palette.plain, links, matches, palette);
+        push(
+            job,
+            text,
+            ws_start..i,
+            font_id,
+            palette.plain,
+            links,
+            matches,
+            palette,
+        );
         if i >= end {
             break;
         }
 
         match bytes[i] {
             b'>' => {
-                push(job, text, i..i + 1, font_id, palette.punctuation, links, matches, palette);
+                push(
+                    job,
+                    text,
+                    i..i + 1,
+                    font_id,
+                    palette.punctuation,
+                    links,
+                    matches,
+                    palette,
+                );
                 break;
             }
             b'/' => {
-                push(job, text, i..i + 1, font_id, palette.punctuation, links, matches, palette);
+                push(
+                    job,
+                    text,
+                    i..i + 1,
+                    font_id,
+                    palette.punctuation,
+                    links,
+                    matches,
+                    palette,
+                );
                 i += 1;
                 continue;
             }
@@ -486,25 +597,62 @@ fn highlight_tag(
         }
 
         let name_start = i;
-        while i < end && !matches!(bytes[i], b'=' | b'>' | b'/') && !bytes[i].is_ascii_whitespace() {
+        while i < end && !matches!(bytes[i], b'=' | b'>' | b'/') && !bytes[i].is_ascii_whitespace()
+        {
             i += 1;
         }
-        push(job, text, name_start..i, font_id, palette.attr_name, links, matches, palette);
+        push(
+            job,
+            text,
+            name_start..i,
+            font_id,
+            palette.attr_name,
+            links,
+            matches,
+            palette,
+        );
 
         let ws_start = i;
         while i < end && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        push(job, text, ws_start..i, font_id, palette.plain, links, matches, palette);
+        push(
+            job,
+            text,
+            ws_start..i,
+            font_id,
+            palette.plain,
+            links,
+            matches,
+            palette,
+        );
 
         if i < end && bytes[i] == b'=' {
-            push(job, text, i..i + 1, font_id, palette.punctuation, links, matches, palette);
+            push(
+                job,
+                text,
+                i..i + 1,
+                font_id,
+                palette.punctuation,
+                links,
+                matches,
+                palette,
+            );
             i += 1;
             let ws_start = i;
             while i < end && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            push(job, text, ws_start..i, font_id, palette.plain, links, matches, palette);
+            push(
+                job,
+                text,
+                ws_start..i,
+                font_id,
+                palette.plain,
+                links,
+                matches,
+                palette,
+            );
 
             if i < end && matches!(bytes[i], b'"' | b'\'') {
                 let quote = bytes[i];
@@ -516,7 +664,16 @@ fn highlight_tag(
                 if i < end {
                     i += 1;
                 }
-                push(job, text, value_start..i, font_id, palette.attr_value, links, matches, palette);
+                push(
+                    job,
+                    text,
+                    value_start..i,
+                    font_id,
+                    palette.attr_value,
+                    links,
+                    matches,
+                    palette,
+                );
             }
         }
     }

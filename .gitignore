@@ -1,1 +1,6 @@
 /target
+
+# egui_kittest snapshot-test scratch files (the baseline .png itself is checked in)
+tests/snapshots/**/*.diff.png
+tests/snapshots/**/*.new.png
+tests/snapshots/**/*.old.png
