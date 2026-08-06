@@ -1538,7 +1538,16 @@ impl App {
                 ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
                     egui::CollapsingHeader::new(&collection.name)
                         .id_salt(collection_id)
-                        .default_open(true)
+                        // Collapsed by default (matches real Postman): with
+                        // a large real-world import (hundreds of requests
+                        // across many collections), starting every
+                        // collection — and every folder inside it, below —
+                        // already expanded meant every single row laid out
+                        // and painted on every frame from the moment the
+                        // sidebar opened, which is exactly what turned into
+                        // visible lag and an overflowing request list once
+                        // real (not toy-sized) data was imported.
+                        .default_open(false)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if ui.small_button("+ request").clicked() {
@@ -4402,12 +4411,25 @@ fn folder_contents(
                     // active tab's own row still gets the full
                     // `selectable_label` highlight below, unchanged from
                     // before tabs existed.
+                    // Real-world imported requests can have very long names
+                    // (and, occasionally, literal embedded newlines from a
+                    // multi-line Postman description mistakenly used as the
+                    // name) — sanitizing the newline and truncating with an
+                    // ellipsis (rather than the plain `ui.selectable_label`
+                    // shortcut, which sizes to fit the *whole* text) keeps
+                    // one long name from stretching the row past the
+                    // sidebar's width, which is what "list overflows" turned
+                    // out to be for a real ~700-request import.
+                    let name = req.name.replace('\n', " ");
                     let label = if req_id != active_id && open_ids.contains(&req_id) {
-                        format!("• {}", req.name)
+                        format!("• {name}")
                     } else {
-                        req.name.clone()
+                        name
                     };
-                    if ui.selectable_label(req_id == active_id, label).clicked() {
+                    if ui
+                        .add(egui::Button::selectable(req_id == active_id, label).truncate())
+                        .clicked()
+                    {
                         actions.push(PendingAction::Load {
                             collection: collection_id,
                             folder_path: path.to_vec(),
@@ -4505,7 +4527,9 @@ fn folder_contents(
                 });
                 egui::CollapsingHeader::new(&folder.name)
                     .id_salt(folder_id)
-                    .default_open(true)
+                    // See the collection header's own comment above — same
+                    // "collapsed by default" fix, one level down.
+                    .default_open(false)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button("+ request").clicked() {
@@ -5055,6 +5079,8 @@ mod tests {
     #[test]
     #[ignore]
     fn egui_kittest_smoke_renders_nested_folders() {
+        use egui_kittest::kittest::Queryable;
+
         let mut data = AppData::default();
         let mut collection = Collection::new("Demo");
         collection.requests.push(RequestItem::new("Get Users"));
@@ -5074,6 +5100,22 @@ mod tests {
             .build_eframe(|_cc| App::with_data(data));
 
         harness.step(); // see the `phase1_smoke` comment above for why not `run()`
+
+        // Collections/folders now start collapsed by default (a later fix
+        // for a real lag/overflow report once a large real-world import
+        // made "everything expanded" render hundreds of rows at once) — so
+        // this test, whose whole point is demonstrating the nested-folder
+        // indentation, has to click each header open first.
+        harness.get_by_label("Demo").click();
+        harness.step();
+        // `get_all_by_label` (not `get_by_label`) here: `kittest`'s
+        // accessibility tree transiently exposes more than one "Auth"-
+        // labeled node while `CollapsingHeader`'s open animation is still
+        // settling from the "Demo" click above — clicking the first match
+        // is enough (this is a test-harness quirk, not something a real
+        // user querying by mouse position would ever hit).
+        harness.get_all_by_label("Auth").next().unwrap().click();
+        harness.step();
         harness.snapshot("phase3_nested_folders");
     }
 
@@ -5108,6 +5150,11 @@ mod tests {
             "starts on the fresh, unrelated default request"
         );
 
+        // Collections start collapsed by default (see the `default_open`
+        // comment near `collections_sidebar` for why) — expand "Demo" first
+        // so "Get Users" is actually rendered to click.
+        harness.get_by_label("Demo").click();
+        harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
 
@@ -5538,6 +5585,9 @@ mod tests {
         harness.step();
         assert_eq!(harness.state().tabs.len(), 1);
 
+        // Collections start collapsed by default — expand "Demo" first.
+        harness.get_by_label("Demo").click();
+        harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
         assert_eq!(
@@ -5578,6 +5628,10 @@ mod tests {
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1100.0, 750.0))
             .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        // Collections start collapsed by default — expand "Demo" first.
+        harness.get_by_label("Demo").click();
         harness.step();
 
         // Open "Get Users" in a second tab — it becomes active, leaving the
@@ -5623,6 +5677,9 @@ mod tests {
             .build_eframe(|_cc| App::with_data(data));
         harness.step();
 
+        // Collections start collapsed by default — expand "Demo" first.
+        harness.get_by_label("Demo").click();
+        harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
         harness.get_by_label("Create Order").click();
