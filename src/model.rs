@@ -459,6 +459,22 @@ impl Collection {
         find_folder_mut_in(&mut self.folders, path)
     }
 
+    /// Read-only counterpart of `find_folder_mut` — used by callers (the
+    /// virtualized sidebar's row-click handler) that only need to look a
+    /// request up by its known folder path, not mutate anything.
+    pub fn find_folder(&self, path: &[Uuid]) -> Option<&Folder> {
+        find_folder_in(&self.folders, path)
+    }
+
+    /// Read-only counterpart of `requests_at_mut`.
+    pub fn requests_at(&self, path: &[Uuid]) -> Option<&Vec<RequestItem>> {
+        if path.is_empty() {
+            Some(&self.requests)
+        } else {
+            self.find_folder(path).map(|f| &f.requests)
+        }
+    }
+
     /// Every request in this collection, depth-first (root requests first,
     /// then each subfolder's own requests, recursively) — the same order the
     /// sidebar renders in. Each request is tagged with its folder path, so a
@@ -644,6 +660,155 @@ impl Collection {
             post_response_script: self.post_response_script.clone(),
         }
     }
+
+    /// A ready-made "Sample Requests" collection covering the app's main
+    /// features (auth, body modes, path params, dynamic variables,
+    /// pre-request/test scripting) with real, working requests — all
+    /// against `postman-echo.com` (Postman's own public echo/testing
+    /// service, the same one their official example collections use), so
+    /// every request in it can actually be sent and inspected, not just
+    /// looked at. Called fresh each time the sidebar's "Add sample
+    /// requests" button is clicked (see `App::add_sample_collection`) —
+    /// every id is freshly minted, so clicking it again after deleting (or
+    /// editing) the collection just gives back a brand new untouched copy.
+    pub fn sample() -> Self {
+        fn kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                enabled: true,
+            }
+        }
+
+        let mut basics = Folder::new("Basics");
+
+        let mut simple_get = RequestItem::new("Simple GET");
+        simple_get.url = "https://postman-echo.com/get?foo1=bar1&foo2=bar2".to_string();
+        simple_get.description =
+            "A plain GET request with two query params — Send it and check the Body tab."
+                .to_string();
+        basics.requests.push(simple_get);
+
+        let mut path_param = RequestItem::new("Path Parameter Example");
+        path_param.url = "https://postman-echo.com/status/:code".to_string();
+        path_param.description =
+            "Demonstrates `:name` path params — edit the \"code\" value in the Params tab (e.g. 404) and resend."
+                .to_string();
+        path_param.path_params.push(kv("code", "200"));
+        basics.requests.push(path_param);
+
+        let mut post_json = RequestItem::new("POST JSON Body");
+        post_json.method = Method::Post;
+        post_json.url = "https://postman-echo.com/post".to_string();
+        post_json.body.mode = BodyMode::Json;
+        post_json.body.raw =
+            "{\n  \"name\": \"RustGirl\",\n  \"kind\": \"Postman clone\"\n}".to_string();
+        basics.requests.push(post_json);
+
+        let mut post_form = RequestItem::new("POST Form (urlencoded)");
+        post_form.method = Method::Post;
+        post_form.url = "https://postman-echo.com/post".to_string();
+        post_form.body.mode = BodyMode::Form;
+        post_form.body.form = vec![kv("field1", "value1"), kv("field2", "value2")];
+        basics.requests.push(post_form);
+
+        let mut post_multipart = RequestItem::new("POST Multipart Form");
+        post_multipart.method = Method::Post;
+        post_multipart.url = "https://postman-echo.com/post".to_string();
+        post_multipart.body.mode = BodyMode::Multipart;
+        post_multipart.body.multipart = vec![FormField {
+            key: "note".to_string(),
+            value: "hello from RustGirl".to_string(),
+            enabled: true,
+            field_type: FormFieldType::Text,
+            file_path: None,
+        }];
+        basics.requests.push(post_multipart);
+
+        let mut auth_examples = Folder::new("Auth Examples");
+
+        let mut basic_auth = RequestItem::new("Basic Auth");
+        basic_auth.url = "https://postman-echo.com/basic-auth".to_string();
+        basic_auth.description =
+            "The server actually checks these credentials (postman/password) and returns 401 if they're wrong — try changing the password."
+                .to_string();
+        basic_auth.auth = AuthConfig {
+            kind: AuthKind::Basic,
+            params: vec![kv("username", "postman"), kv("password", "password")],
+        };
+        auth_examples.requests.push(basic_auth);
+
+        let mut bearer_auth = RequestItem::new("Bearer Token");
+        bearer_auth.url = "https://postman-echo.com/bearer".to_string();
+        bearer_auth.auth = AuthConfig {
+            kind: AuthKind::Bearer,
+            params: vec![kv("token", "sample-token-123")],
+        };
+        auth_examples.requests.push(bearer_auth);
+
+        let mut api_key_auth = RequestItem::new("API Key (query)");
+        api_key_auth.url = "https://postman-echo.com/get".to_string();
+        api_key_auth.description =
+            "The server doesn't check this one, but it shows the ApiKey-in-query auth kind adding `?apikey=...` to the outgoing request — see the Request tab of the response after sending."
+                .to_string();
+        api_key_auth.auth = AuthConfig {
+            kind: AuthKind::ApiKey,
+            params: vec![
+                kv("key", "apikey"),
+                kv("value", "sample-key"),
+                kv("in", "query"),
+            ],
+        };
+        auth_examples.requests.push(api_key_auth);
+
+        let mut scripting_examples = Folder::new("Scripting Examples");
+
+        let mut dynamic_vars = RequestItem::new("Dynamic Variables");
+        dynamic_vars.url =
+            "https://postman-echo.com/get?requestId={{$guid}}&ts={{$timestamp}}".to_string();
+        dynamic_vars.description =
+            "`{{$guid}}`/`{{$timestamp}}` are resolved fresh on every send — Send this twice and compare the two `args` in the response body."
+                .to_string();
+        scripting_examples.requests.push(dynamic_vars);
+
+        let mut scripted = RequestItem::new("Pre-request & Test Script");
+        scripted.url = "https://postman-echo.com/get".to_string();
+        scripted.description =
+            "Has both a pre-request script (writes a global) and a test script (asserts on the response) — open the Pre-request Script/Tests tabs to see them, then Send and check the Tests tab."
+                .to_string();
+        scripted.pre_request_script = "\
+-- Runs before the request is sent.
+local runs = tonumber(pm.globals.get(\"sampleRunCount\")) or 0
+pm.globals.set(\"sampleRunCount\", tostring(runs + 1))
+console.log(\"This is send number \" .. pm.globals.get(\"sampleRunCount\") .. \" of this request\")
+"
+        .to_string();
+        scripted.post_response_script = "\
+-- Runs once the response arrives.
+pm.test(\"Status code is 200\", function()
+    assert(pm.response.status == 200)
+end)
+
+local data = pm.response:json()
+pm.test(\"Response body parses as JSON\", function()
+    assert(data ~= nil)
+end)
+"
+        .to_string();
+        scripting_examples.requests.push(scripted);
+
+        let mut collection = Self::new("Sample Requests");
+        collection.description = "\
+A ready-made set of example requests covering RustGirl's main features — \
+auth, body modes, path params, dynamic variables, and pre-request/test \
+scripting. Every request points at postman-echo.com (Postman's own public \
+echo service) so it can actually be sent, not just looked at. Deleted this \
+by mistake? The sidebar's \"Add sample requests\" button brings back a \
+fresh copy anytime."
+            .to_string();
+        collection.folders = vec![basics, auth_examples, scripting_examples];
+        collection
+    }
 }
 
 fn find_folder_mut_in<'a>(folders: &'a mut [Folder], path: &[Uuid]) -> Option<&'a mut Folder> {
@@ -747,6 +912,152 @@ pub fn container_scripts_for(
     chain
 }
 
+/// One visible row in the flattened collection tree — computed fresh each
+/// frame by `flatten_visible_rows` from `App.data.collections` +
+/// `App.expanded_nodes`, then rendered by `app.rs`'s sidebar via
+/// `egui::ScrollArea::show_rows`, which needs a flat, index-addressable
+/// list to virtualize over (confirmed against the cached egui source: it
+/// only knows "row N covers pixel range [N*h, (N+1)*h)", it can't itself
+/// understand a recursive/nested tree). A collapsed collection/folder
+/// contributes exactly one row (itself); its children are never even
+/// visited, so a huge collapsed subtree costs nothing to flatten either,
+/// not just nothing to render.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowKind {
+    Collection {
+        id: Uuid,
+    },
+    /// `parent_path` is the folder's own parent's path (empty = collection
+    /// root) — same convention `PendingAction::DeleteFolder`'s
+    /// `parent_path` already uses.
+    Folder {
+        collection: Uuid,
+        parent_path: Vec<Uuid>,
+        id: Uuid,
+    },
+    /// `folder_path` is the path to the request's *containing* folder
+    /// (empty = collection root).
+    Request {
+        collection: Uuid,
+        folder_path: Vec<Uuid>,
+        id: Uuid,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub kind: RowKind,
+    pub depth: usize,
+    pub name: String,
+    /// `Some` only for `RowKind::Request` rows.
+    pub method: Option<Method>,
+    /// The hotkey (if any) assigned to this request — `Some` only for
+    /// `RowKind::Request` rows, and only when that request's id is a value
+    /// in `AppData.hotkey_bindings`. Reverse-looked-up once by the caller
+    /// (see `reverse_hotkey_bindings`) rather than scanning the whole map
+    /// per row.
+    pub hotkey: Option<char>,
+}
+
+/// `AppData.hotkey_bindings` maps key → request id; rendering needs the
+/// other direction (request id → key) once per frame, not a per-row scan
+/// over every binding.
+pub fn reverse_hotkey_bindings(
+    bindings: &std::collections::HashMap<char, Uuid>,
+) -> std::collections::HashMap<Uuid, char> {
+    bindings.iter().map(|(&k, &id)| (id, k)).collect()
+}
+
+/// Flattens every collection — and, for each expanded collection/folder
+/// (membership in `expanded`, keyed by the node's own id), everything
+/// inside it — into one ordered, depth-first list: root collections first,
+/// then (for an expanded collection) its own requests, then its folders
+/// (each recursed into the same way if also expanded). Same traversal
+/// order the old recursive renderer used and `Collection::flatten_requests`
+/// already established for requests alone.
+pub fn flatten_visible_rows(
+    collections: &[Collection],
+    expanded: &std::collections::HashSet<Uuid>,
+    hotkeys: &std::collections::HashMap<Uuid, char>,
+) -> Vec<Row> {
+    let mut out = Vec::new();
+    for c in collections {
+        out.push(Row {
+            kind: RowKind::Collection { id: c.id },
+            depth: 0,
+            name: c.name.clone(),
+            method: None,
+            hotkey: None,
+        });
+        if expanded.contains(&c.id) {
+            flatten_folder_contents_into(
+                c.id,
+                &[],
+                &c.requests,
+                &c.folders,
+                1,
+                expanded,
+                hotkeys,
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_folder_contents_into(
+    collection: Uuid,
+    path: &[Uuid],
+    requests: &[RequestItem],
+    folders: &[Folder],
+    depth: usize,
+    expanded: &std::collections::HashSet<Uuid>,
+    hotkeys: &std::collections::HashMap<Uuid, char>,
+    out: &mut Vec<Row>,
+) {
+    for r in requests {
+        out.push(Row {
+            kind: RowKind::Request {
+                collection,
+                folder_path: path.to_vec(),
+                id: r.id,
+            },
+            depth,
+            name: r.name.clone(),
+            method: Some(r.method),
+            hotkey: hotkeys.get(&r.id).copied(),
+        });
+    }
+    for f in folders {
+        out.push(Row {
+            kind: RowKind::Folder {
+                collection,
+                parent_path: path.to_vec(),
+                id: f.id,
+            },
+            depth,
+            name: f.name.clone(),
+            method: None,
+            hotkey: None,
+        });
+        if expanded.contains(&f.id) {
+            let mut child_path = path.to_vec();
+            child_path.push(f.id);
+            flatten_folder_contents_into(
+                collection,
+                &child_path,
+                &f.requests,
+                &f.folders,
+                depth + 1,
+                expanded,
+                hotkeys,
+                out,
+            );
+        }
+    }
+}
+
 /// Resolves `{{key}}` placeholders in `text` against a precedence-ordered
 /// list of variable scopes — earlier scopes win. A key present only in a
 /// later (lower-precedence) scope is still substituted, just with that
@@ -768,6 +1079,32 @@ pub fn resolve_variables(text: &str, scopes: &[&[KeyValue]]) -> String {
         }
     }
     resolve_dynamic_variables(&out)
+}
+
+/// Scans already-`resolve_variables`-processed text for any `{{...}}`
+/// placeholder still left in it — i.e. a variable that wasn't defined in
+/// any active scope (or an unrecognized `{{$name}}` dynamic one). Meant to
+/// turn a URL like `{{baseUrl}}/foo` (no active Environment defining
+/// `baseUrl`, so it's still there verbatim) into a clear, actionable error
+/// *before* handing it to `reqwest` — which would otherwise fail to parse
+/// it as a URL at all and report a bare, contextless "builder error", the
+/// exact confusing failure a real user hit.
+pub fn find_unresolved_variables(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after_open = &rest[start + 2..];
+        match after_open.find("}}") {
+            Some(end) => {
+                out.push(after_open[..end].to_string());
+                rest = &after_open[end + 2..];
+            }
+            // Unterminated `{{...` with no closing `}}` — not a real
+            // placeholder, nothing further to scan.
+            None => break,
+        }
+    }
+    out
 }
 
 /// Postman's "dynamic variables" — `{{$name}}` placeholders that don't come
@@ -937,6 +1274,26 @@ pub struct HistoryEntry {
     pub test_results: Vec<TestResult>,
 }
 
+/// One row in the Postman-style Console (`App.console`) — a lighter-weight
+/// sibling of `HistoryEntry`: no full `sent_request`/`response` snapshot
+/// (the Console's job is "what happened just now," not "replay this exact
+/// response" — that's what History/Saved Examples are for), but it does
+/// carry `script_log`, which `HistoryEntry` doesn't have at all. Session-
+/// only (`App.console` isn't persisted through `AppData`/`storage::save`);
+/// `storage::append_console_log` writes the same information to a plain
+/// text log file for after-the-fact troubleshooting instead.
+#[derive(Clone, Debug)]
+pub struct ConsoleEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub method: Method,
+    pub url: String,
+    pub status: Option<u16>,
+    pub duration_ms: Option<u128>,
+    pub error: Option<String>,
+    pub script_log: Vec<String>,
+    pub test_results: Vec<TestResult>,
+}
+
 /// Client-level configuration — proxy/TLS — persisted separately from
 /// `AppData` (`storage::settings_file`) since it configures the HTTP
 /// client itself rather than being request/collection state. Not part of
@@ -1011,6 +1368,15 @@ pub struct AppData {
     /// collection — lowest precedence in [`resolve_variables`].
     #[serde(default)]
     pub globals: Vec<KeyValue>,
+    /// Which request (by its own stable id) opens when Option/Alt+key is
+    /// pressed — see `App::pending_hotkey_assignment` (the sidebar's
+    /// "Assign hotkey…" context-menu entry sets it) and the matching
+    /// `Alt`+key loop in `fn ui` (execution). A flat map here, not a field
+    /// on `RequestItem` itself: assigning/clearing a hotkey never touches
+    /// the widely-shared `RequestItem`/`Folder`/`Collection` serde shape,
+    /// and stays correct no matter which folder the request gets moved to.
+    #[serde(default)]
+    pub hotkey_bindings: std::collections::HashMap<char, Uuid>,
 }
 
 #[cfg(test)]
@@ -1045,6 +1411,29 @@ mod tests {
             resolved,
             "https://env.example.com/x?token=collection-token&g=global-value"
         );
+    }
+
+    /// Regression test for a real reported bug: a request whose URL
+    /// resolved to `{{baseUrl}}/...` (no active Environment defining
+    /// `baseUrl`) failed with a bare, contextless "Failed to build request:
+    /// builder error" — `reqwest` couldn't parse the still-templated string
+    /// as a URL at all, and its error message doesn't say why. This is the
+    /// detector that lets `http_client::send_request` catch it earlier and
+    /// report something actionable instead.
+    #[test]
+    fn find_unresolved_variables_reports_every_leftover_placeholder() {
+        assert_eq!(
+            find_unresolved_variables("{{baseUrl}}/internal/:enterpriseId"),
+            vec!["baseUrl".to_string()]
+        );
+        assert_eq!(
+            find_unresolved_variables("{{baseUrl}}/x?token={{token}}"),
+            vec!["baseUrl".to_string(), "token".to_string()]
+        );
+        assert!(find_unresolved_variables("https://example.com/x").is_empty());
+        // An unterminated `{{...` (typo, missing closing brace) doesn't
+        // panic — just stops scanning rather than reporting a bogus name.
+        assert!(find_unresolved_variables("https://example.com/{{oops").is_empty());
     }
 
     #[test]
@@ -1537,5 +1926,142 @@ mod tests {
                 ("-- inner".to_string(), "-- inner post".to_string()),
             ]
         );
+    }
+
+    /// `Collection::sample()` should keep covering the specific features its
+    /// own doc comment promises (auth kinds, body modes, scripts, path
+    /// params) — a structural check that catches an edit accidentally
+    /// dropping one of them, not a byte-for-byte snapshot of the wording.
+    #[test]
+    fn sample_collection_covers_auth_body_modes_and_scripts() {
+        let sample = Collection::sample();
+        assert_eq!(sample.name, "Sample Requests");
+        assert_eq!(sample.folders.len(), 3);
+
+        let all_requests: Vec<&RequestItem> = sample
+            .folders
+            .iter()
+            .flat_map(|f| f.requests.iter())
+            .collect();
+        assert!(all_requests.len() >= 8);
+        assert!(
+            all_requests
+                .iter()
+                .all(|r| r.url.starts_with("https://postman-echo.com"))
+        );
+
+        let auth_kinds: Vec<AuthKind> = all_requests.iter().map(|r| r.auth.kind).collect();
+        assert!(auth_kinds.contains(&AuthKind::Basic));
+        assert!(auth_kinds.contains(&AuthKind::Bearer));
+        assert!(auth_kinds.contains(&AuthKind::ApiKey));
+
+        let body_modes: Vec<BodyMode> = all_requests.iter().map(|r| r.body.mode).collect();
+        assert!(body_modes.contains(&BodyMode::Json));
+        assert!(body_modes.contains(&BodyMode::Form));
+        assert!(body_modes.contains(&BodyMode::Multipart));
+
+        assert!(
+            all_requests.iter().any(|r| !r.path_params.is_empty()),
+            "at least one request should demonstrate `:name` path params"
+        );
+        assert!(
+            all_requests
+                .iter()
+                .any(|r| !r.pre_request_script.is_empty() && !r.post_response_script.is_empty()),
+            "at least one request should demonstrate pre-request + test scripting"
+        );
+
+        // Fresh ids every call — calling it twice (e.g. clicking the sidebar
+        // button a second time) must never collide with the first copy.
+        let second = Collection::sample();
+        assert_ne!(sample.id, second.id);
+    }
+
+    /// A fixture matching the same 2-level-nested shape used by several
+    /// other tree tests in this file: collection "Demo" → root request
+    /// "Get Users" → folder "Auth" (request "Login") → subfolder "Tokens"
+    /// (request "Refresh Token").
+    fn flatten_rows_fixture() -> Collection {
+        let mut tokens = Folder::new("Tokens");
+        tokens.requests.push(RequestItem::new("Refresh Token"));
+        let mut auth = Folder::new("Auth");
+        auth.requests.push(RequestItem::new("Login"));
+        auth.folders.push(tokens);
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Get Users"));
+        collection.folders.push(auth);
+        collection
+    }
+
+    #[test]
+    fn flatten_visible_rows_shows_only_the_collection_when_nothing_is_expanded() {
+        let collections = vec![flatten_rows_fixture()];
+        let expanded = std::collections::HashSet::new();
+        let rows = flatten_visible_rows(&collections, &expanded, &std::collections::HashMap::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].kind,
+            RowKind::Collection {
+                id: collections[0].id
+            }
+        );
+        assert_eq!(rows[0].depth, 0);
+    }
+
+    #[test]
+    fn flatten_visible_rows_reveals_only_direct_children_when_one_level_expanded() {
+        let collections = vec![flatten_rows_fixture()];
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(collections[0].id);
+        let rows = flatten_visible_rows(&collections, &expanded, &std::collections::HashMap::new());
+
+        // Collection + its own root request "Get Users" + the "Auth" folder
+        // header — but NOT "Auth"'s own children, since "Auth" itself isn't
+        // in `expanded`.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].name, "Get Users");
+        assert_eq!(rows[1].depth, 1);
+        assert!(matches!(rows[1].kind, RowKind::Request { .. }));
+        assert_eq!(rows[2].name, "Auth");
+        assert_eq!(rows[2].depth, 1);
+        assert!(matches!(rows[2].kind, RowKind::Folder { .. }));
+    }
+
+    #[test]
+    fn flatten_visible_rows_walks_down_to_a_nested_expanded_folder() {
+        let collections = vec![flatten_rows_fixture()];
+        let auth_id = collections[0].folders[0].id;
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(collections[0].id);
+        expanded.insert(auth_id);
+        let rows = flatten_visible_rows(&collections, &expanded, &std::collections::HashMap::new());
+
+        // Collection, "Get Users", "Auth", "Login" (Auth's own request),
+        // "Tokens" (Auth's subfolder) — "Tokens" itself isn't expanded, so
+        // "Refresh Token" inside it doesn't show up.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3].name, "Login");
+        assert_eq!(rows[3].depth, 2);
+        assert_eq!(rows[4].name, "Tokens");
+        assert_eq!(rows[4].depth, 2);
+        assert!(matches!(rows[4].kind, RowKind::Folder { .. }));
+    }
+
+    #[test]
+    fn flatten_visible_rows_populates_the_hotkey_badge_from_a_reverse_lookup() {
+        let collection = flatten_rows_fixture();
+        let root_req_id = collection.requests[0].id;
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert('g', root_req_id);
+        let hotkeys = reverse_hotkey_bindings(&bindings);
+
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(collection.id);
+        let rows = flatten_visible_rows(&[collection], &expanded, &hotkeys);
+
+        let get_users_row = rows.iter().find(|r| r.name == "Get Users").unwrap();
+        assert_eq!(get_users_row.hotkey, Some('g'));
+        // Every other row (the collection header itself) has no hotkey.
+        assert_eq!(rows[0].hotkey, None);
     }
 }

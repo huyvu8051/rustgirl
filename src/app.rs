@@ -2,9 +2,9 @@ use crate::codegen;
 use crate::curl_import;
 use crate::http_client::{self, HttpResponse, RequestOutcome, SentRequest};
 use crate::model::{
-    self, AppData, AuthConfig, AuthKind, BodyMode, Collection, Environment, Folder, FormField,
-    FormFieldType, HistoryEntry, KeyValue, Method, RequestItem, SavedExample, Settings, TestResult,
-    ThemeMode,
+    self, AppData, AuthConfig, AuthKind, BodyMode, Collection, ConsoleEntry, Environment, Folder,
+    FormField, FormFieldType, HistoryEntry, KeyValue, Method, RequestItem, SavedExample, Settings,
+    TestResult, ThemeMode,
 };
 use crate::openapi_import;
 use crate::postman_format;
@@ -58,6 +58,7 @@ enum CentralView {
         collection: Uuid,
         folder_path: Vec<Uuid>,
     },
+    Console,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -105,14 +106,15 @@ enum DragPayload {
 /// delete/load, generalized so one recursive render function can handle
 /// every depth without fighting the borrow checker over `self.data`.
 enum PendingAction {
+    /// Loads a request into a tab — carries just the id (not a cloned
+    /// `RequestItem`, unlike before the tree-virtualization rewrite): row
+    /// rendering now only ever has a flattened `model::Row` on hand, not a
+    /// live `&RequestItem`, so the actual `RequestItem` is looked up by id
+    /// from `self.data.collections` once the action is applied.
     Load {
         collection: Uuid,
         folder_path: Vec<Uuid>,
-        // Boxed per clippy's `large_enum_variant`: `RequestItem` is by far
-        // the biggest field in this enum, so indirecting just this one
-        // variant keeps every `PendingAction` value (constructed and
-        // discarded every frame the sidebar renders) small.
-        request: Box<RequestItem>,
+        id: Uuid,
     },
     AddRequest {
         collection: Uuid,
@@ -146,7 +148,10 @@ enum PendingAction {
     /// `App::apply_rename`) rather than carrying a path — simpler than
     /// threading an item-kind tag through the recursive renderer just for
     /// this one action.
-    Rename { id: Uuid, new_name: String },
+    Rename {
+        id: Uuid,
+        new_name: String,
+    },
     MoveRequest {
         collection: Uuid,
         from_path: Vec<Uuid>,
@@ -172,9 +177,42 @@ enum PendingAction {
         collection: Uuid,
         folder_path: Vec<Uuid>,
     },
+    /// Collection-level counterparts of the folder/request actions above —
+    /// folded into the same `PendingAction`/`actions: Vec<PendingAction>`
+    /// accumulator (rather than the half-dozen separate `Option<Uuid>`
+    /// locals `collections_sidebar` used before the tree-virtualization
+    /// rewrite) since the new flat `render_tree_row` handles every row kind
+    /// in one function and pushes into one shared `actions` list either way.
+    DeleteCollection(Uuid),
+    DuplicateCollection(Uuid),
+    EditCollection(Uuid),
+    ExportCollection(Uuid),
+    RunCollection {
+        collection: Uuid,
+        name: String,
+    },
+    /// Starts the "press a key to assign" capture flow (`App::
+    /// pending_hotkey_assignment`) for one request.
+    AssignHotkey(Uuid),
 }
 
-/// A non-request action offered by the Cmd/Ctrl+K command palette
+/// One leader-key chord `fn ui` recognizes (see `LEADER_CHORDS`) — a table
+/// rather than a single hardcoded check so a future chord costs one more
+/// entry, not new plumbing.
+#[derive(Clone, Copy)]
+enum LeaderAction {
+    OpenPalette,
+}
+
+/// Leader-key sequences, checked only while nothing has keyboard focus
+/// (Space still types a literal space in every text field otherwise) —
+/// the command palette's *only* trigger now, replacing the old Alt+Space/
+/// Cmd+K bindings per explicit user preference (neovim-style `<leader>sf`,
+/// not a plain shortcut). The leading space is part of the stored match
+/// string purely for readability.
+const LEADER_CHORDS: &[(&str, LeaderAction)] = &[(" sf", LeaderAction::OpenPalette)];
+
+/// A non-request action offered by the command palette
 /// (`App::command_palette`) — every variant is a thin wrapper over a field
 /// assignment that already exists elsewhere (a button, a shortcut), not new
 /// behavior.
@@ -410,6 +448,13 @@ pub struct App {
     /// as its own field (not folded into `data`) since it's session-only,
     /// never persisted.
     runner: RunnerState,
+    /// A running, in-app log of every send (across every tab) plus its
+    /// script `console.log` output and test results — Postman's own
+    /// "Console" panel. Session-only, newest-first, capped the same way
+    /// `data.history` is (see `push_console_entry`) — the durable trail
+    /// for troubleshooting *after* a restart is the separate `console.log`
+    /// text file `push_console_entry` also writes to on every entry.
+    console: Vec<ConsoleEntry>,
     /// Separate from `tx`/`rx` above: unrelated event shape (`RunnerEvent`
     /// vs. `(Uuid, RequestOutcome)`) and unrelated consumer (`poll_runner`
     /// vs. `poll_responses`), so kept as its own channel rather than
@@ -451,10 +496,57 @@ pub struct App {
     /// saved-examples strip's chip rename (see the `OpenTab` doc comment).
     renaming: Option<(Uuid, String)>,
 
-    /// Opt/Alt+Space quick-open: search every request by name/URL/method.
+    /// Which collections/folders (by their own id) are currently expanded
+    /// in the sidebar tree — the actual source of truth `flatten_visible_rows`
+    /// reads every frame to decide what to include, replacing egui's own
+    /// per-`CollapsingHeader` memory (which the old recursive renderer
+    /// relied on, and which a flat, virtualized `show_rows` list can't
+    /// consult before it knows what to lay out). Empty by default — same
+    /// "collapsed by default" starting point the pre-virtualization fix
+    /// already established. "Expand all"/"Collapse all" mutate this
+    /// directly (insert every id / clear it) instead of the old
+    /// one-shot-per-frame `tree_force_open` field this replaced.
+    expanded_nodes: std::collections::HashSet<Uuid>,
+
+    /// `Some(request_id)` while the sidebar's "Assign hotkey…" context-menu
+    /// entry is waiting for the user to press a `0`-`9`/`a`-`z` key (no
+    /// modifier — the *next* raw key, not an Option/Alt-chord) to bind to
+    /// that request; `fn ui`'s shortcut block checks this every frame and
+    /// clears it once a key is captured (or Escape cancels it). See
+    /// `AppData.hotkey_bindings` for where the binding itself lives, and
+    /// the `Alt`+key loop (also in `fn ui`) for how it's actually invoked
+    /// afterward.
+    pending_hotkey_assignment: Option<Uuid>,
+
+    /// The command palette's leader-key chord in progress — empty when
+    /// none is (the common case). Only builds up while nothing has
+    /// keyboard focus (see `fn ui`'s own check), so Space still types a
+    /// literal space in every text field. See `LEADER_CHORDS`.
+    leader_buffer: String,
+    /// When the in-progress chord above expires if no further matching key
+    /// arrives — `None` exactly when `leader_buffer` is empty.
+    leader_deadline: Option<std::time::Instant>,
+
+    /// Search every request by name/URL/method — opened by completing a
+    /// leader-key chord (see `LEADER_CHORDS`), not a plain keyboard
+    /// shortcut anymore.
     search_open: bool,
     search_query: String,
     search_needs_focus: bool,
+    /// Which entry in the command palette's filtered list is highlighted —
+    /// `Ctrl+N`/`Ctrl+P` (Emacs-style) move it, Enter picks whichever one
+    /// this points at. Reset to `0` whenever the palette opens or the
+    /// query text changes, matching fzf/telescope's own "a new filter
+    /// always starts selection back at the top" convention.
+    palette_selected: usize,
+    /// The fzf-quality fuzzy matcher backing the command palette's scoring
+    /// (see `fuzzy_score`/`fuzzy_score_request`) — kept as a persistent
+    /// field and reused every frame rather than constructed fresh each
+    /// time: `nucleo_matcher::Matcher::new` eagerly allocates a sizable
+    /// scratch buffer (~135KB per its own docs), which the crate's own
+    /// docs specifically say to reuse when matching is called often, like
+    /// once per candidate on every frame the palette is open.
+    fuzzy_matcher: nucleo_matcher::Matcher,
 
     /// Window size as of last frame, to detect an active resize drag.
     last_screen_size: Option<egui::Vec2>,
@@ -489,10 +581,11 @@ impl App {
     }
 
     fn with_data_settings_and_jar(
-        data: AppData,
+        mut data: AppData,
         settings: Settings,
         cookie_jar: std::sync::Arc<CookieStoreMutex>,
     ) -> Self {
+        migrate_number_shortcuts_to_hotkey_bindings(&mut data);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -512,6 +605,7 @@ impl App {
             tx,
             rx,
             runner: RunnerState::default(),
+            console: Vec::new(),
             runner_tx,
             runner_rx,
             sidebar_tab: SidebarTab::Collections,
@@ -528,9 +622,15 @@ impl App {
             curl_import_text: String::new(),
             import_message: None,
             renaming: None,
+            expanded_nodes: std::collections::HashSet::new(),
+            pending_hotkey_assignment: None,
+            leader_buffer: String::new(),
+            leader_deadline: None,
             search_open: false,
             search_query: String::new(),
             search_needs_focus: false,
+            palette_selected: 0,
+            fuzzy_matcher: nucleo_matcher::Matcher::default(),
             last_screen_size: None,
             resize_settle_deadline: None,
         }
@@ -555,48 +655,79 @@ impl App {
         storage::save_cookie_jar(&self.cookie_jar);
     }
 
+    /// Adds one entry to the in-app Console (newest-first, capped the same
+    /// way `data.history` is) and appends the same information to the
+    /// on-disk `console.log` text trail — called once per completed send,
+    /// success or failure, right where `HistoryEntry` is already built.
+    fn push_console_entry(&mut self, entry: ConsoleEntry) {
+        storage::append_console_log(&entry);
+        self.console.insert(0, entry);
+        self.console.truncate(500);
+    }
+
     // ---------- Import / Export ----------
 
+    /// Imports every file the user selects in one go (Postman's own import
+    /// dialog also accepts multiple files at once) — one collection is
+    /// added per file, a single `save()` happens after the whole batch
+    /// rather than once per file, and the status line summarizes all of
+    /// them together instead of only ever reporting the last one.
     fn import_postman_collection(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
-            .pick_file()
+            .pick_files()
         else {
             return;
         };
-        self.import_message = Some(match std::fs::read_to_string(&path) {
-            Ok(contents) => match postman_format::import_collection(&contents) {
-                Ok((collection, warnings)) => {
-                    let name = collection.name.clone();
-                    self.data.collections.push(collection);
-                    self.save();
-                    describe_import_result(&format!("Postman collection {name:?}"), &warnings)
-                }
-                Err(e) => format!("Import failed: {e}"),
-            },
-            Err(e) => format!("Could not read file: {e}"),
-        });
+        let mut added_any = false;
+        let results: Vec<String> = paths
+            .iter()
+            .map(|path| match std::fs::read_to_string(path) {
+                Ok(contents) => match postman_format::import_collection(&contents) {
+                    Ok((collection, warnings)) => {
+                        let name = collection.name.clone();
+                        self.data.collections.push(collection);
+                        added_any = true;
+                        describe_import_result(&format!("Postman collection {name:?}"), &warnings)
+                    }
+                    Err(e) => format!("{}: import failed: {e}", path.display()),
+                },
+                Err(e) => format!("{}: could not read file: {e}", path.display()),
+            })
+            .collect();
+        if added_any {
+            self.save();
+        }
+        self.import_message = Some(results.join(" | "));
     }
 
     fn import_openapi_spec(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("OpenAPI", &["json", "yaml", "yml"])
-            .pick_file()
+            .pick_files()
         else {
             return;
         };
-        self.import_message = Some(match std::fs::read_to_string(&path) {
-            Ok(contents) => match openapi_import::import_openapi(&contents) {
-                Ok((collection, warnings)) => {
-                    let name = collection.name.clone();
-                    self.data.collections.push(collection);
-                    self.save();
-                    describe_import_result(&format!("OpenAPI spec {name:?}"), &warnings)
-                }
-                Err(e) => format!("Import failed: {e}"),
-            },
-            Err(e) => format!("Could not read file: {e}"),
-        });
+        let mut added_any = false;
+        let results: Vec<String> = paths
+            .iter()
+            .map(|path| match std::fs::read_to_string(path) {
+                Ok(contents) => match openapi_import::import_openapi(&contents) {
+                    Ok((collection, warnings)) => {
+                        let name = collection.name.clone();
+                        self.data.collections.push(collection);
+                        added_any = true;
+                        describe_import_result(&format!("OpenAPI spec {name:?}"), &warnings)
+                    }
+                    Err(e) => format!("{}: import failed: {e}", path.display()),
+                },
+                Err(e) => format!("{}: could not read file: {e}", path.display()),
+            })
+            .collect();
+        if added_any {
+            self.save();
+        }
+        self.import_message = Some(results.join(" | "));
     }
 
     /// Parses `self.curl_import_text` and, on success, loads it as an
@@ -622,24 +753,44 @@ impl App {
     }
 
     fn import_postman_environment(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
-            .pick_file()
+            .pick_files()
         else {
             return;
         };
-        let result = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|contents| postman_format::import_environment(&contents));
-        self.import_message = Some(match result {
-            Ok(env) => {
-                let name = env.name.clone();
-                self.data.environments.push(env);
-                self.save();
-                format!("Imported environment {name:?}")
-            }
-            Err(e) => format!("Import failed: {e}"),
-        });
+        let mut added_any = false;
+        let results: Vec<String> = paths
+            .iter()
+            .map(|path| {
+                let result = std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|contents| postman_format::import_environment(&contents));
+                match result {
+                    Ok(env) => {
+                        let name = env.name.clone();
+                        self.data.environments.push(env);
+                        added_any = true;
+                        format!("Imported environment {name:?}")
+                    }
+                    Err(e) => format!("{}: import failed: {e}", path.display()),
+                }
+            })
+            .collect();
+        if added_any {
+            self.save();
+        }
+        self.import_message = Some(results.join(" | "));
+    }
+
+    /// Adds a fresh copy of `Collection::sample()` — self-service, so a user
+    /// who deleted or messed with the sample collection can always get a
+    /// clean one back without needing to ask for it to be re-seeded by
+    /// hand (which is how it was done before this button existed).
+    fn add_sample_collection(&mut self) {
+        self.data.collections.push(Collection::sample());
+        self.save();
+        self.import_message = Some("Added the \"Sample Requests\" collection".to_string());
     }
 
     fn export_collection_to_file(&mut self, collection_id: Uuid) {
@@ -762,8 +913,19 @@ impl App {
                         error: None,
                         test_results: tab.test_results.clone(),
                     };
+                    let console_entry = ConsoleEntry {
+                        timestamp: chrono::Utc::now(),
+                        method: tab.current_request.method,
+                        url: tab.current_request.url.clone(),
+                        status: Some(response.status),
+                        duration_ms: Some(response.duration_ms),
+                        error: None,
+                        script_log: tab.script_log.clone(),
+                        test_results: tab.test_results.clone(),
+                    };
                     self.data.history.insert(0, entry);
                     self.data.history.truncate(200);
+                    self.push_console_entry(console_entry);
                     let tab = &mut self.tabs[idx];
                     tab.sent_request = Some(request);
                     tab.response = Some(response);
@@ -829,8 +991,19 @@ impl App {
                         error: Some(message.clone()),
                         test_results: tab.test_results.clone(),
                     };
+                    let console_entry = ConsoleEntry {
+                        timestamp: chrono::Utc::now(),
+                        method: tab.current_request.method,
+                        url: tab.current_request.url.clone(),
+                        status: None,
+                        duration_ms,
+                        error: Some(message.clone()),
+                        script_log: tab.script_log.clone(),
+                        test_results: tab.test_results.clone(),
+                    };
                     self.data.history.insert(0, entry);
                     self.data.history.truncate(200);
+                    self.push_console_entry(console_entry);
                     let tab = &mut self.tabs[idx];
                     tab.sent_request = request;
                     tab.response = None;
@@ -1384,10 +1557,24 @@ impl App {
                 }
 
                 ui.separator();
+                let console_label = if self.console.is_empty() {
+                    "Console".to_string()
+                } else {
+                    format!("Console ({})", self.console.len())
+                };
+                if ui.button(console_label).clicked() {
+                    self.central_view = CentralView::Console;
+                }
                 if ui.button("Settings").clicked() {
                     self.central_view = CentralView::Settings;
                 }
             });
+            if self.pending_hotkey_assignment.is_some() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Press a key (0-9, a-z) to assign a hotkey to this request — Esc to cancel.",
+                );
+            }
         });
     }
 
@@ -1467,6 +1654,15 @@ impl App {
             {
                 self.curl_import_open = !self.curl_import_open;
             }
+            if ui
+                .small_button("🧪 Add sample requests")
+                .on_hover_text(
+                    "Add a ready-made \"Sample Requests\" collection to try the app's features",
+                )
+                .clicked()
+            {
+                self.add_sample_collection();
+            }
         });
         if self.curl_import_open {
             ui.add(
@@ -1488,175 +1684,73 @@ impl App {
         if let Some(msg) = self.import_message.clone() {
             ui.weak(msg);
         }
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Expand all")
+                .on_hover_text("Open every collection and folder")
+                .clicked()
+            {
+                for c in &self.data.collections {
+                    self.expanded_nodes.insert(c.id);
+                    insert_all_folder_ids(&c.folders, &mut self.expanded_nodes);
+                }
+            }
+            if ui
+                .small_button("Collapse all")
+                .on_hover_text("Close every collection and folder")
+                .clicked()
+            {
+                self.expanded_nodes.clear();
+            }
+        });
         ui.separator();
 
-        let mut actions: Vec<PendingAction> = Vec::new();
-        let mut delete_collection: Option<Uuid> = None;
-        let mut duplicate_collection: Option<Uuid> = None;
-        let mut edit_collection: Option<Uuid> = None;
-        let mut export_collection: Option<Uuid> = None;
-        let mut run_collection: Option<(Uuid, String)> = None;
         // Two-tier highlighting: `active_id` gets the full selected-row
         // highlight (same as before tabs existed), `open_ids` gets a small
         // marker for "open in some other tab."
         let active_id = self.active_tab().current_request.id;
         let open_ids: std::collections::HashSet<Uuid> =
             self.tabs.iter().map(|t| t.current_request.id).collect();
-        // Taken out for the duration of the render pass so the recursive
-        // renderer can read/write it without fighting the borrow checker
-        // over `self.data.collections` being borrowed at the same time —
-        // put back once rendering is done, below.
+        // Flattened fresh every frame from `self.data.collections` +
+        // `self.expanded_nodes` — an owned `Vec<model::Row>`, not a borrow
+        // into `self.data`, so rendering below can freely take `&mut`
+        // borrows of other `self` fields (`expanded_nodes`, `renaming`)
+        // without fighting the borrow checker the way the old recursive
+        // renderer (which held live `&mut Collection`/`&mut Folder`
+        // references throughout) would have.
+        let hotkeys_by_request = model::reverse_hotkey_bindings(&self.data.hotkey_bindings);
+        let rows = model::flatten_visible_rows(
+            &self.data.collections,
+            &self.expanded_nodes,
+            &hotkeys_by_request,
+        );
+        // Taken out for the duration of the render pass, same reasoning as
+        // before the rewrite — put back once rendering is done, below.
         let mut renaming = self.renaming.take();
+        let mut actions: Vec<PendingAction> = Vec::new();
 
-        for collection in &mut self.data.collections {
-            let collection_id = collection.id;
-
-            if renaming
-                .as_ref()
-                .is_some_and(|(id, _)| *id == collection_id)
-            {
-                let (_, buf) = renaming.as_mut().unwrap();
-                let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
-                if resp.lost_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let new_name = buf.trim().to_string();
-                        if !new_name.is_empty() {
-                            actions.push(PendingAction::Rename {
-                                id: collection_id,
-                                new_name,
-                            });
-                        }
-                    }
-                    renaming = None;
-                } else {
-                    resp.request_focus();
-                }
-                continue;
-            }
-
-            let (zone, dropped) =
-                ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
-                    egui::CollapsingHeader::new(&collection.name)
-                        .id_salt(collection_id)
-                        // Collapsed by default (matches real Postman): with
-                        // a large real-world import (hundreds of requests
-                        // across many collections), starting every
-                        // collection — and every folder inside it, below —
-                        // already expanded meant every single row laid out
-                        // and painted on every frame from the moment the
-                        // sidebar opened, which is exactly what turned into
-                        // visible lag and an overflowing request list once
-                        // real (not toy-sized) data was imported.
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("+ request").clicked() {
-                                    actions.push(PendingAction::AddRequest {
-                                        collection: collection_id,
-                                        folder_path: Vec::new(),
-                                    });
-                                }
-                                if ui.small_button("+ folder").clicked() {
-                                    actions.push(PendingAction::AddFolder {
-                                        collection: collection_id,
-                                        folder_path: Vec::new(),
-                                    });
-                                }
-                                if icon_button(ui, "🗑", "Delete collection").clicked() {
-                                    delete_collection = Some(collection_id);
-                                }
-                                if ui
-                                    .small_button("📤 Export")
-                                    .on_hover_text("Export as a Postman collection (.json)")
-                                    .clicked()
-                                {
-                                    export_collection = Some(collection_id);
-                                }
-                                // Plain ASCII, not "▶": U+25B6 sits in the same
-                                // Geometric Shapes block as "●" (U+25CF), which
-                                // Phase 8's snapshot caught as an unrendered
-                                // tofu box in this same font — not worth
-                                // re-discovering that per icon.
-                                if ui
-                                    .small_button("Run")
-                                    .on_hover_text("Open this collection in the Collection Runner")
-                                    .clicked()
-                                {
-                                    run_collection = Some((collection_id, collection.name.clone()));
-                                }
-                            });
-
-                            // "Saved Requests" root-level requests are reachable via
-                            // Option/Alt+1..9 (`open_saved_request`) — numbered here
-                            // so that shortcut is discoverable.
-                            let number_first_nine = collection.name == "Saved Requests";
-                            folder_contents(
-                                ui,
-                                collection_id,
-                                &[],
-                                &mut collection.requests,
-                                &mut collection.folders,
-                                active_id,
-                                &open_ids,
-                                number_first_nine,
-                                &mut renaming,
-                                &mut actions,
-                            );
-                        });
-                });
-
-            if let Some(dropped) = dropped {
-                match (*dropped).clone() {
-                    DragPayload::Request {
-                        collection: c,
-                        folder_path: from_path,
-                        id,
-                    } if c == collection_id => {
-                        actions.push(PendingAction::MoveRequest {
-                            collection: c,
-                            from_path,
-                            id,
-                            to_path: Vec::new(),
-                            before_id: None,
-                        });
-                    }
-                    DragPayload::Folder {
-                        collection: c,
-                        parent_path: from_path,
-                        id,
-                    } if c == collection_id => {
-                        actions.push(PendingAction::MoveFolder {
-                            collection: c,
-                            from_path,
-                            id,
-                            to_path: Vec::new(),
-                            before_id: None,
-                        });
-                    }
-                    // Cross-collection drag-and-drop isn't supported.
-                    _ => {}
-                }
-            }
-
-            zone.response.context_menu(|ui| {
-                if ui.button("Rename").clicked() {
-                    renaming = Some((collection_id, collection.name.clone()));
-                    ui.close();
-                }
-                if ui.button("Edit").clicked() {
-                    edit_collection = Some(collection_id);
-                    ui.close();
-                }
-                if ui.button("Duplicate").clicked() {
-                    duplicate_collection = Some(collection_id);
-                    ui.close();
-                }
-                if ui.button("Delete").clicked() {
-                    delete_collection = Some(collection_id);
-                    ui.close();
+        // A single fixed row height for every row kind — required by
+        // `show_rows` (confirmed against the cached egui source: it only
+        // takes one `row_height_sans_spacing`, not a per-row callback), and
+        // safe here since every row's content is already single-line
+        // (long request names are truncated with an ellipsis, not wrapped).
+        let row_height = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("collections_tree_rows")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                for row in &rows[range] {
+                    render_tree_row(
+                        ui,
+                        row,
+                        &mut self.expanded_nodes,
+                        active_id,
+                        &open_ids,
+                        &mut renaming,
+                        &mut actions,
+                    );
                 }
             });
-        }
 
         self.renaming = renaming;
 
@@ -1666,9 +1760,19 @@ impl App {
                 PendingAction::Load {
                     collection,
                     folder_path,
-                    request,
+                    id,
                 } => {
-                    self.open_request_in_tab(collection, folder_path, *request);
+                    if let Some(req) = self
+                        .data
+                        .collections
+                        .iter()
+                        .find(|c| c.id == collection)
+                        .and_then(|c| c.requests_at(&folder_path))
+                        .and_then(|list| list.iter().find(|r| r.id == id))
+                        .cloned()
+                    {
+                        self.open_request_in_tab(collection, folder_path, req);
+                    }
                 }
                 PendingAction::AddRequest {
                     collection,
@@ -1712,10 +1816,17 @@ impl App {
                         .find(|c| c.id == collection)
                         && let Some(list) = c.requests_at_mut(&folder_path)
                     {
-                        list.retain(|r| r.id != id);
-                        save_needed = true;
+                        let name = list
+                            .iter()
+                            .find(|r| r.id == id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        if confirm_delete(&format!("the request \"{name}\"")) {
+                            list.retain(|r| r.id != id);
+                            save_needed = true;
+                            self.clear_origin_if_deleted_request(id);
+                        }
                     }
-                    self.clear_origin_if_deleted_request(id);
                 }
                 PendingAction::DeleteFolder {
                     collection,
@@ -1729,10 +1840,19 @@ impl App {
                         .find(|c| c.id == collection)
                         && let Some(list) = c.folders_at_mut(&parent_path)
                     {
-                        list.retain(|f| f.id != id);
-                        save_needed = true;
+                        let name = list
+                            .iter()
+                            .find(|f| f.id == id)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default();
+                        if confirm_delete(&format!(
+                            "the folder \"{name}\" and everything inside it"
+                        )) {
+                            list.retain(|f| f.id != id);
+                            save_needed = true;
+                            self.clear_origin_if_deleted_folder(id);
+                        }
                     }
-                    self.clear_origin_if_deleted_folder(id);
                 }
                 PendingAction::DuplicateRequest {
                     collection,
@@ -1830,42 +1950,56 @@ impl App {
                         folder_path,
                     };
                 }
-            }
-        }
-
-        if let Some(id) = delete_collection {
-            self.data.collections.retain(|c| c.id != id);
-            save_needed = true;
-            for tab in &mut self.tabs {
-                if matches!(&tab.origin, RequestOrigin::Collection { collection, .. } if *collection == id)
-                {
-                    tab.origin = RequestOrigin::Unsaved;
+                PendingAction::DeleteCollection(id) => {
+                    let name = self
+                        .data
+                        .collections
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    if confirm_delete(&format!(
+                        "the collection \"{name}\" and everything inside it"
+                    )) {
+                        self.data.collections.retain(|c| c.id != id);
+                        save_needed = true;
+                        for tab in &mut self.tabs {
+                            if matches!(&tab.origin, RequestOrigin::Collection { collection, .. } if *collection == id)
+                            {
+                                tab.origin = RequestOrigin::Unsaved;
+                            }
+                        }
+                    }
+                }
+                PendingAction::DuplicateCollection(id) => {
+                    if let Some(idx) = self.data.collections.iter().position(|c| c.id == id) {
+                        let dup = self.data.collections[idx].duplicate();
+                        self.data.collections.insert(idx + 1, dup);
+                        save_needed = true;
+                    }
+                }
+                PendingAction::EditCollection(id) => {
+                    self.central_view = CentralView::CollectionEditor(id);
+                }
+                PendingAction::ExportCollection(id) => {
+                    self.export_collection_to_file(id);
+                }
+                PendingAction::RunCollection { collection, name } => {
+                    self.runner = RunnerState {
+                        collection: Some(collection),
+                        target_label: name,
+                        ..RunnerState::default()
+                    };
+                    self.central_view = CentralView::Runner;
+                }
+                PendingAction::AssignHotkey(id) => {
+                    self.pending_hotkey_assignment = Some(id);
                 }
             }
         }
-        if let Some(id) = duplicate_collection
-            && let Some(idx) = self.data.collections.iter().position(|c| c.id == id)
-        {
-            let dup = self.data.collections[idx].duplicate();
-            self.data.collections.insert(idx + 1, dup);
-            save_needed = true;
-        }
-        if let Some(id) = edit_collection {
-            self.central_view = CentralView::CollectionEditor(id);
-        }
+
         if save_needed {
             self.save();
-        }
-        if let Some(id) = export_collection {
-            self.export_collection_to_file(id);
-        }
-        if let Some((id, name)) = run_collection {
-            self.runner = RunnerState {
-                collection: Some(id),
-                target_label: name,
-                ..RunnerState::default()
-            };
-            self.central_view = CentralView::Runner;
         }
     }
 
@@ -1967,23 +2101,50 @@ impl App {
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
     }
 
-    /// Opens the (0-indexed) Nth request directly under the default "Saved
-    /// Requests" collection — bound to Option/Alt+1..9 in the main update
-    /// loop. A no-op if that collection or request slot doesn't exist.
-    fn open_saved_request(&mut self, index: usize) {
-        let Some(collection) = self
-            .data
-            .collections
-            .iter()
-            .find(|c| c.name == "Saved Requests")
-        else {
+    /// Every real UI path that closes a tab (the × button, Cmd/Ctrl+W, the
+    /// command palette's "Close Tab") goes through this, not `close_tab`
+    /// directly — a dirty tab gets a native "close anyway?" confirmation
+    /// first, via the same blocking `rfd` dialog pattern already used for
+    /// file pickers elsewhere in this file. `close_tab` itself stays a
+    /// plain, dialog-free mutation so existing tests (and this method
+    /// itself) can keep calling it directly without popping a real OS
+    /// dialog in a headless test run.
+    fn close_tab_with_confirmation(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get(idx) else {
             return;
         };
-        let Some(req) = collection.requests.get(index).cloned() else {
+        if !tab.is_dirty() {
+            self.close_tab(idx);
             return;
-        };
-        let collection_id = collection.id;
-        self.open_request_in_tab(collection_id, Vec::new(), req);
+        }
+        let name = tab.current_request.name.clone();
+        let result = rfd::MessageDialog::new()
+            .set_title("Close tab?")
+            .set_description(format!("\"{name}\" has unsaved changes. Close it anyway?"))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if result == rfd::MessageDialogResult::Yes {
+            self.close_tab(idx);
+        }
+    }
+
+    /// Finds a request anywhere in `self.data.collections` by its own id
+    /// and opens it via `open_request_in_tab` — the execution side of the
+    /// Option/Alt+key hotkey system (`AppData.hotkey_bindings`). A stale
+    /// binding (the request was since deleted, or moved into a collection
+    /// that no longer exists) is silently a no-op, not an error — the same
+    /// tolerance `open_request_in_tab`'s other callers already have for a
+    /// missing target.
+    fn open_request_by_id(&mut self, id: Uuid) {
+        for c in &self.data.collections {
+            if let Some((folder_path, req)) =
+                c.flatten_requests().into_iter().find(|(_, r)| r.id == id)
+            {
+                let collection_id = c.id;
+                self.open_request_in_tab(collection_id, folder_path, req);
+                return;
+            }
+        }
     }
 
     fn environments_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2059,16 +2220,25 @@ impl App {
             self.export_environment_to_file(id);
         }
         if let Some(id) = delete_env {
-            self.data.environments.retain(|e| e.id != id);
-            if self.active_environment == Some(id) {
-                self.active_environment = None;
+            let name = self
+                .data
+                .environments
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            if confirm_delete(&format!("the environment \"{name}\"")) {
+                self.data.environments.retain(|e| e.id != id);
+                if self.active_environment == Some(id) {
+                    self.active_environment = None;
+                }
+                self.save();
             }
-            self.save();
         }
     }
 
     fn history_sidebar(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Clear history").clicked() {
+        if ui.button("Clear history").clicked() && confirm_delete("all history") {
             self.data.history.clear();
             self.save();
         }
@@ -2175,7 +2345,7 @@ impl App {
     fn perform_palette_action(&mut self, action: PaletteAction) {
         match action {
             PaletteAction::NewTab => self.new_blank_tab(),
-            PaletteAction::CloseActiveTab => self.close_tab(self.active_tab),
+            PaletteAction::CloseActiveTab => self.close_tab_with_confirmation(self.active_tab),
             PaletteAction::SaveActiveRequest => self.save_current_request(),
             PaletteAction::OpenSettings => self.central_view = CentralView::Settings,
             PaletteAction::OpenRunner => self.central_view = CentralView::Runner,
@@ -2191,7 +2361,7 @@ impl App {
         }
     }
 
-    // ---------- UI: Cmd/Ctrl+K (and Opt/Alt+Space) command palette ----------
+    // ---------- UI: leader-key ("space s f") command palette ----------
     fn command_palette(&mut self, ctx: &egui::Context) {
         if !self.search_open {
             return;
@@ -2218,46 +2388,94 @@ impl App {
                     response.request_focus();
                     self.search_needs_focus = false;
                 }
+                if response.changed() {
+                    self.palette_selected = 0;
+                }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
 
                 ui.separator();
 
-                let query = self.search_query.trim().to_lowercase();
+                let query = self.search_query.trim().to_string();
 
-                // Actions first, then matching requests — same convention
-                // as VS Code/other editors' command palettes.
-                let mut entries: Vec<PaletteEntry> = self
+                // Every candidate (actions and requests alike) is fuzzy-
+                // scored and the whole list sorted by score, rather than
+                // the old "actions first, then requests" fixed grouping —
+                // real fzf-style pickers rank by relevance regardless of
+                // kind. The *stable* sort still means an empty query (every
+                // score tied at 0) preserves today's original insertion
+                // order, so "show everything, unranked" looks the same as
+                // before; only an actual query reorders anything.
+                let mut scored: Vec<(u32, PaletteEntry)> = self
                     .palette_actions()
                     .into_iter()
-                    .filter(|(label, _)| query.is_empty() || label.to_lowercase().contains(&query))
-                    .map(|(label, action)| PaletteEntry::Action { label, action })
+                    .filter_map(|(label, action)| {
+                        let score = fuzzy_score(&mut self.fuzzy_matcher, &label, &query)?;
+                        Some((score, PaletteEntry::Action { label, action }))
+                    })
                     .collect();
 
-                let mut matches: Vec<(Uuid, Vec<Uuid>, &RequestItem)> = Vec::new();
                 for c in &self.data.collections {
                     for r in &c.requests {
-                        if request_matches_query(r, &query) {
-                            matches.push((c.id, Vec::new(), r));
+                        if let Some(score) = fuzzy_score_request(&mut self.fuzzy_matcher, r, &query)
+                        {
+                            scored.push((
+                                score,
+                                PaletteEntry::Request {
+                                    collection: c.id,
+                                    folder_path: Vec::new(),
+                                    item: Box::new(r.clone()),
+                                },
+                            ));
                         }
                     }
                     let mut path = Vec::new();
-                    collect_matching_requests(&c.folders, &mut path, &query, c.id, &mut matches);
+                    let mut matches = Vec::new();
+                    collect_matching_requests(
+                        &c.folders,
+                        &mut path,
+                        &query,
+                        c.id,
+                        &mut self.fuzzy_matcher,
+                        &mut matches,
+                    );
+                    scored.extend(matches.into_iter().map(
+                        |(score, collection, folder_path, item)| {
+                            (
+                                score,
+                                PaletteEntry::Request {
+                                    collection,
+                                    folder_path,
+                                    item: Box::new(item.clone()),
+                                },
+                            )
+                        },
+                    ));
                 }
-                matches.truncate(50);
-                entries.extend(matches.into_iter().map(|(collection, folder_path, item)| {
-                    PaletteEntry::Request {
-                        collection,
-                        folder_path,
-                        item: Box::new(item.clone()),
+                scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                scored.truncate(50);
+                let entries: Vec<PaletteEntry> = scored.into_iter().map(|(_, e)| e).collect();
+
+                // Emacs-style Ctrl+N/Ctrl+P move the highlighted entry,
+                // wrapping at both ends — the palette had no selection
+                // cursor at all before this (Enter always picked the very
+                // first entry, regardless of what was visibly on top).
+                if !entries.is_empty() {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+                        self.palette_selected = (self.palette_selected + 1) % entries.len();
                     }
-                }));
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+                        self.palette_selected =
+                            (self.palette_selected + entries.len() - 1) % entries.len();
+                    }
+                }
+                self.palette_selected = self.palette_selected.min(entries.len().saturating_sub(1));
 
                 let enter_pressed =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter_pressed && let Some(first) = entries.first() {
-                    selected = Some(first.clone());
+                if enter_pressed && let Some(picked) = entries.get(self.palette_selected) {
+                    selected = Some(picked.clone());
                 }
 
                 egui::ScrollArea::vertical()
@@ -2266,7 +2484,7 @@ impl App {
                         if entries.is_empty() {
                             ui.weak("No matching requests or commands.");
                         }
-                        for entry in &entries {
+                        for (i, entry) in entries.iter().enumerate() {
                             let label = match entry {
                                 PaletteEntry::Action { label, .. } => format!("> {label}"),
                                 PaletteEntry::Request { item, .. } => {
@@ -2278,7 +2496,10 @@ impl App {
                                     )
                                 }
                             };
-                            if ui.selectable_label(false, label).clicked() {
+                            if ui
+                                .selectable_label(i == self.palette_selected, label)
+                                .clicked()
+                            {
                                 selected = Some(entry.clone());
                             }
                         }
@@ -2342,6 +2563,7 @@ impl App {
                 collection,
                 folder_path,
             } => self.folder_editor(ui, collection, &folder_path),
+            CentralView::Console => self.console_panel(ui),
         });
     }
 
@@ -2422,7 +2644,7 @@ impl App {
             self.active_tab = idx;
         }
         if let Some(idx) = close_idx {
-            self.close_tab(idx);
+            self.close_tab_with_confirmation(idx);
         }
         if let Some((from, to)) = reorder
             && from != to
@@ -2907,12 +3129,22 @@ impl App {
             }
             Some(ExampleAction::Delete(id)) => {
                 let tab = self.active_tab_mut();
-                tab.current_request.saved_examples.retain(|e| e.id != id);
-                if tab.viewing_example == Some(id) {
-                    tab.viewing_example = None;
+                let name = tab
+                    .current_request
+                    .saved_examples
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                if confirm_delete(&format!("the saved example \"{name}\"")) {
+                    let tab = self.active_tab_mut();
+                    tab.current_request.saved_examples.retain(|e| e.id != id);
+                    if tab.viewing_example == Some(id) {
+                        tab.viewing_example = None;
+                    }
+                    self.sync_tab_into_data(self.active_tab);
+                    self.save();
                 }
-                self.sync_tab_into_data(self.active_tab);
-                self.save();
             }
             Some(ExampleAction::StartRename(id)) => {
                 let name = self.tabs[self.active_tab]
@@ -3572,6 +3804,73 @@ impl App {
             self.central_view = CentralView::Request;
         }
         self.save();
+    }
+
+    /// Postman-style Console — a running, in-app log of every send (across
+    /// every tab), including script `console.log` output and test results.
+    /// Session-only (cleared here doesn't touch the durable `console.log`
+    /// text file `push_console_entry` also writes to on every send).
+    fn console_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Console");
+        ui.horizontal(|ui| {
+            if ui.button("Clear console").clicked() {
+                self.console.clear();
+            }
+            ui.weak(format!(
+                "Also logged to: {}",
+                storage::console_log_path().display()
+            ));
+        });
+        ui.separator();
+
+        if self.console.is_empty() {
+            ui.weak("Nothing sent yet this session.");
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Oldest first — reads top-to-bottom like a real terminal log,
+            // unlike `self.console`'s own newest-first storage order (which
+            // matches `data.history`'s convention for "most recent at the
+            // top of a short list," not what a scrolling log should do).
+            for entry in self.console.iter().rev() {
+                let status_text = match (entry.status, &entry.error) {
+                    (Some(status), _) => format!("{status}"),
+                    (None, Some(err)) => format!("ERROR: {err}"),
+                    (None, None) => "(no response)".to_string(),
+                };
+                let color = match entry.status {
+                    Some(s) if s < 300 => egui::Color32::GREEN,
+                    Some(s) if s < 400 => egui::Color32::YELLOW,
+                    _ => egui::Color32::RED,
+                };
+                ui.horizontal(|ui| {
+                    ui.weak(entry.timestamp.format("%H:%M:%S").to_string());
+                    ui.label(entry.method.as_str());
+                    ui.label(&entry.url);
+                    ui.colored_label(color, status_text);
+                    if let Some(ms) = entry.duration_ms {
+                        ui.weak(format!("{ms}ms"));
+                    }
+                });
+                for line in &entry.script_log {
+                    ui.monospace(format!("  console.log: {line}"));
+                }
+                if !entry.test_results.is_empty() {
+                    let passed = entry.test_results.iter().filter(|t| t.passed).count();
+                    let color = if passed == entry.test_results.len() {
+                        egui::Color32::GREEN
+                    } else {
+                        egui::Color32::RED
+                    };
+                    ui.colored_label(
+                        color,
+                        format!("  tests: {passed}/{}", entry.test_results.len()),
+                    );
+                }
+                ui.separator();
+            }
+        });
     }
 
     fn runner_panel(&mut self, ui: &mut egui::Ui) {
@@ -4244,33 +4543,66 @@ fn effective_wrap_width(ctx: &egui::Context, id: egui::Id, wrap_width: f32, free
     wrap_width
 }
 
-fn request_matches_query(item: &RequestItem, query: &str) -> bool {
+/// Scores how well `query` fuzzy-matches `haystack` via `nucleo_matcher`'s
+/// fzf-quality algorithm — non-contiguous subsequence matches (e.g. `"crq"`
+/// matches `"Create Request"`), ranked by word-boundary/consecutive-
+/// character/proximity bonuses, `Some(score)` (higher is better) or `None`
+/// if it doesn't match at all. Replaces the old plain
+/// `.to_lowercase().contains(query)` substring check this was built to fix
+/// ("fuzzy chưa ngon như fzf"). An empty query matches everything with a
+/// score of 0 — ties are broken by the caller's *stable* sort preserving
+/// insertion order, so "show everything, unranked" when nothing's typed
+/// yet still looks the same as before.
+fn fuzzy_score(matcher: &mut nucleo_matcher::Matcher, haystack: &str, query: &str) -> Option<u32> {
     if query.is_empty() {
-        return true;
+        return Some(0);
     }
-    item.name.to_lowercase().contains(query)
-        || item.url.to_lowercase().contains(query)
-        || item.method.as_str().to_lowercase().contains(query)
+    let mut haystack_buf = Vec::new();
+    let mut query_buf = Vec::new();
+    let haystack = nucleo_matcher::Utf32Str::new(haystack, &mut haystack_buf);
+    let query = nucleo_matcher::Utf32Str::new(query, &mut query_buf);
+    matcher.fuzzy_match(haystack, query).map(u32::from)
+}
+
+/// Fuzzy-scores a request against `query` across name/URL/method, keeping
+/// whichever field scores highest — so a method match like `"post"` isn't
+/// buried under an unrelated name that scores lower (or doesn't match at
+/// all).
+fn fuzzy_score_request(
+    matcher: &mut nucleo_matcher::Matcher,
+    item: &RequestItem,
+    query: &str,
+) -> Option<u32> {
+    [
+        fuzzy_score(matcher, &item.name, query),
+        fuzzy_score(matcher, &item.url, query),
+        fuzzy_score(matcher, item.method.as_str(), query),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// Recursively collects every request matching `query` from `folders` (and
 /// their subfolders, arbitrarily deep), tagging each with the full folder
-/// path it was found at — used by the Opt/Alt+Space quick-open search.
+/// path it was found at and its fuzzy score — used by the command
+/// palette's request search.
 fn collect_matching_requests<'a>(
     folders: &'a [Folder],
     path: &mut Vec<Uuid>,
     query: &str,
     collection_id: Uuid,
-    out: &mut Vec<(Uuid, Vec<Uuid>, &'a RequestItem)>,
+    matcher: &mut nucleo_matcher::Matcher,
+    out: &mut Vec<(u32, Uuid, Vec<Uuid>, &'a RequestItem)>,
 ) {
     for folder in folders {
         path.push(folder.id);
         for r in &folder.requests {
-            if request_matches_query(r, query) {
-                out.push((collection_id, path.clone(), r));
+            if let Some(score) = fuzzy_score_request(matcher, r, query) {
+                out.push((score, collection_id, path.clone(), r));
             }
         }
-        collect_matching_requests(&folder.folders, path, query, collection_id, out);
+        collect_matching_requests(&folder.folders, path, query, collection_id, matcher, out);
         path.pop();
     }
 }
@@ -4345,292 +4677,569 @@ fn script_editor(ui: &mut egui::Ui, id_salt: &str, script: &mut String) {
     });
 }
 
-/// Renders one folder's own contents — its requests, then its subfolders
-/// (each recursed into) — appending any triggered side effects to `actions`
-/// rather than mutating `self` directly, since callers hold `requests`/
-/// `folders` borrowed out of `self.data.collections` while this runs.
-/// `path` is this folder's own path (empty = collection root).
-#[allow(clippy::too_many_arguments)]
-fn folder_contents(
+/// Every hotkey-assignable character — `'0'..='9'` then `'a'..='z'`, the
+/// same key space AeroSpace itself uses for workspace keys, *minus*
+/// `h`/`j`/`k`/`l`: that whole row is reserved for AeroSpace-style
+/// Option+H/L tab navigation (`j`/`k` aren't bound to anything yet, but are
+/// held back rather than handed out, since the user explicitly wants that
+/// whole row for navigation and just hasn't decided what `j`/`k` do yet).
+const HOTKEY_CHARS: &str = "0123456789abcdefgimnopqrstuvwxyz";
+
+/// Maps a hotkey character to the `egui::Key` that must be pressed for it —
+/// `None` for anything outside `HOTKEY_CHARS`.
+fn key_for_char(c: char) -> Option<egui::Key> {
+    match c {
+        '0' => Some(egui::Key::Num0),
+        '1' => Some(egui::Key::Num1),
+        '2' => Some(egui::Key::Num2),
+        '3' => Some(egui::Key::Num3),
+        '4' => Some(egui::Key::Num4),
+        '5' => Some(egui::Key::Num5),
+        '6' => Some(egui::Key::Num6),
+        '7' => Some(egui::Key::Num7),
+        '8' => Some(egui::Key::Num8),
+        '9' => Some(egui::Key::Num9),
+        'a' => Some(egui::Key::A),
+        'b' => Some(egui::Key::B),
+        'c' => Some(egui::Key::C),
+        'd' => Some(egui::Key::D),
+        'e' => Some(egui::Key::E),
+        'f' => Some(egui::Key::F),
+        'g' => Some(egui::Key::G),
+        'h' => Some(egui::Key::H),
+        'i' => Some(egui::Key::I),
+        'j' => Some(egui::Key::J),
+        'k' => Some(egui::Key::K),
+        'l' => Some(egui::Key::L),
+        'm' => Some(egui::Key::M),
+        'n' => Some(egui::Key::N),
+        'o' => Some(egui::Key::O),
+        'p' => Some(egui::Key::P),
+        'q' => Some(egui::Key::Q),
+        'r' => Some(egui::Key::R),
+        's' => Some(egui::Key::S),
+        't' => Some(egui::Key::T),
+        'u' => Some(egui::Key::U),
+        'v' => Some(egui::Key::V),
+        'w' => Some(egui::Key::W),
+        'x' => Some(egui::Key::X),
+        'y' => Some(egui::Key::Y),
+        'z' => Some(egui::Key::Z),
+        _ => None,
+    }
+}
+
+/// One-time upgrade path: before this feature existed, Alt+1..9 always
+/// opened the first 9 top-level requests of a collection specifically
+/// named "Saved Requests" (the old `App::open_saved_request`). Since
+/// that's now superseded by general per-request hotkeys, this preserves
+/// the exact same muscle memory for anyone who already relied on it — but
+/// only if `hotkey_bindings` is still empty (a fresh install, or the first run
+/// after upgrading; once the user assigns *any* hotkey, even to an
+/// unrelated request, this never runs again).
+fn migrate_number_shortcuts_to_hotkey_bindings(data: &mut AppData) {
+    if !data.hotkey_bindings.is_empty() {
+        return;
+    }
+    let Some(collection) = data.collections.iter().find(|c| c.name == "Saved Requests") else {
+        return;
+    };
+    for (i, req) in collection.requests.iter().take(9).enumerate() {
+        let key = char::from_digit(i as u32 + 1, 10).expect("0..9 always converts");
+        data.hotkey_bindings.insert(key, req.id);
+    }
+}
+
+/// Recursively inserts every folder's own id (at every depth) into
+/// `expanded` — the "Expand all" button's helper, since `flatten_visible_rows`
+/// only descends into a folder that's already a member of the set.
+fn insert_all_folder_ids(folders: &[Folder], expanded: &mut std::collections::HashSet<Uuid>) {
+    for f in folders {
+        expanded.insert(f.id);
+        insert_all_folder_ids(&f.folders, expanded);
+    }
+}
+
+/// Draws one row of the flattened, virtualized collection tree — the
+/// replacement for the old recursive `folder_contents` (which held live
+/// `&mut Folder`/`&mut RequestItem` references and drew a nested
+/// `CollapsingHeader` per folder). Every row is now just data
+/// (`model::Row`), dispatched by kind to one of the three row-renderers
+/// below. Toolbar actions that used to live inside a collection/folder's
+/// `CollapsingHeader` body (+Request, +Folder, Delete, Export, Run) — only
+/// reachable when expanded — moved into the row's own context menu instead
+/// (alongside Rename/Duplicate/Delete, which were already there), so every
+/// action is reachable regardless of expand state and every row stays a
+/// single fixed height, which `show_rows`-based virtualization requires.
+fn render_tree_row(
     ui: &mut egui::Ui,
-    collection_id: Uuid,
-    path: &[Uuid],
-    requests: &mut [RequestItem],
-    folders: &mut [Folder],
+    row: &model::Row,
+    expanded: &mut std::collections::HashSet<Uuid>,
     active_id: Uuid,
     open_ids: &std::collections::HashSet<Uuid>,
-    number_first_nine: bool,
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
 ) {
-    for (i, req) in requests.iter_mut().enumerate() {
-        let req_id = req.id;
-        let payload = DragPayload::Request {
-            collection: collection_id,
-            folder_path: path.to_vec(),
-            id: req_id,
-        };
-        let drag_id = egui::Id::new(("req-row", collection_id, path.to_vec(), req_id));
+    const INDENT_PX: f32 = 16.0;
+    ui.horizontal(|ui| {
+        ui.add_space(row.depth as f32 * INDENT_PX);
+        match &row.kind {
+            model::RowKind::Collection { id } => {
+                render_collection_row(ui, *id, &row.name, expanded, renaming, actions);
+            }
+            model::RowKind::Folder {
+                collection,
+                parent_path,
+                id,
+            } => {
+                render_folder_row(
+                    ui,
+                    *collection,
+                    parent_path,
+                    *id,
+                    &row.name,
+                    expanded,
+                    renaming,
+                    actions,
+                );
+            }
+            model::RowKind::Request {
+                collection,
+                folder_path,
+                id,
+            } => {
+                render_request_row(
+                    ui,
+                    *collection,
+                    folder_path,
+                    *id,
+                    &row.name,
+                    row.method,
+                    row.hotkey,
+                    active_id,
+                    open_ids,
+                    renaming,
+                    actions,
+                );
+            }
+        }
+    });
+}
 
-        let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
-            ui.horizontal(|ui| {
-                // A dedicated drag handle, separate from the selectable
-                // label below: wrapping the whole row in `dnd_drag_source`
-                // (as an earlier version of this did) intercepts plain
-                // clicks — its own `Sense::drag()` interact sits on top of
-                // the label's `Sense::click()` and swallows the click
-                // before it reaches the label, so the request could never
-                // be selected. Same fix as the folder handle above.
-                ui.dnd_drag_source(drag_id, payload.clone(), |ui| {
-                    ui.weak("::");
-                });
-
-                if renaming.as_ref().is_some_and(|(id, _)| *id == req_id) {
-                    let (_, buf) = renaming.as_mut().unwrap();
-                    let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(160.0));
-                    if resp.lost_focus() {
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let new_name = buf.trim().to_string();
-                            if !new_name.is_empty() {
-                                actions.push(PendingAction::Rename {
-                                    id: req_id,
-                                    new_name,
-                                });
-                            }
-                        }
-                        *renaming = None;
-                    } else {
-                        resp.request_focus();
-                    }
-                } else {
-                    if number_first_nine && i < 9 {
-                        ui.weak(format!("{}", i + 1));
-                    }
-                    ui.label(req.method.as_str());
-                    // A small marker for "open in some other tab" — the
-                    // active tab's own row still gets the full
-                    // `selectable_label` highlight below, unchanged from
-                    // before tabs existed.
-                    // Real-world imported requests can have very long names
-                    // (and, occasionally, literal embedded newlines from a
-                    // multi-line Postman description mistakenly used as the
-                    // name) — sanitizing the newline and truncating with an
-                    // ellipsis (rather than the plain `ui.selectable_label`
-                    // shortcut, which sizes to fit the *whole* text) keeps
-                    // one long name from stretching the row past the
-                    // sidebar's width, which is what "list overflows" turned
-                    // out to be for a real ~700-request import.
-                    let name = req.name.replace('\n', " ");
-                    let label = if req_id != active_id && open_ids.contains(&req_id) {
-                        format!("• {name}")
-                    } else {
-                        name
-                    };
-                    if ui
-                        .add(egui::Button::selectable(req_id == active_id, label).truncate())
-                        .clicked()
-                    {
-                        actions.push(PendingAction::Load {
-                            collection: collection_id,
-                            folder_path: path.to_vec(),
-                            request: Box::new(req.clone()),
+fn render_collection_row(
+    ui: &mut egui::Ui,
+    collection_id: Uuid,
+    name: &str,
+    expanded: &mut std::collections::HashSet<Uuid>,
+    renaming: &mut Option<(Uuid, String)>,
+    actions: &mut Vec<PendingAction>,
+) {
+    let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+        if renaming
+            .as_ref()
+            .is_some_and(|(id, _)| *id == collection_id)
+        {
+            let (_, buf) = renaming.as_mut().unwrap();
+            let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
+            if resp.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let new_name = buf.trim().to_string();
+                    if !new_name.is_empty() {
+                        actions.push(PendingAction::Rename {
+                            id: collection_id,
+                            new_name,
                         });
                     }
                 }
-            });
-        });
+                *renaming = None;
+            } else {
+                resp.request_focus();
+            }
+        } else {
+            let is_open = expanded.contains(&collection_id);
+            // Plain ASCII, not a Unicode triangle glyph: "▶"/"▼" (U+25B6/
+            // U+25BC) sit in the same Geometric Shapes block as "●"
+            // (U+25CF), which Phases 2/3/8/9's snapshots already caught as
+            // unrendered tofu boxes in this exact bundled font — a
+            // recurring, well-documented lesson in this codebase, not
+            // worth rediscovering per icon.
+            let toggle_clicked = ui.small_button(if is_open { "v" } else { ">" }).clicked();
+            // The name itself is *also* clickable and toggles the same
+            // state — `CollapsingHeader` (what this replaced) let you click
+            // anywhere on the header row, not just a dedicated arrow, and
+            // existing tests/muscle-memory rely on clicking the name text
+            // directly (e.g. `get_by_label("Demo")`).
+            let name_clicked = ui
+                .add(
+                    egui::Button::new(egui::RichText::new(name).strong())
+                        .truncate()
+                        .frame(false),
+                )
+                .clicked();
+            if toggle_clicked || name_clicked {
+                if is_open {
+                    expanded.remove(&collection_id);
+                } else {
+                    expanded.insert(collection_id);
+                }
+            }
+        }
+    });
 
-        if let Some(dropped) = dropped
-            && let DragPayload::Request {
+    if let Some(dropped) = dropped {
+        match (*dropped).clone() {
+            DragPayload::Request {
                 collection: c,
                 folder_path: from_path,
                 id,
-            } = (*dropped).clone()
-            && c == collection_id
-        {
-            actions.push(PendingAction::MoveRequest {
+            } if c == collection_id => {
+                actions.push(PendingAction::MoveRequest {
+                    collection: c,
+                    from_path,
+                    id,
+                    to_path: Vec::new(),
+                    before_id: None,
+                });
+            }
+            DragPayload::Folder {
                 collection: c,
-                from_path,
+                parent_path: from_path,
                 id,
-                to_path: path.to_vec(),
-                before_id: Some(req_id),
+            } if c == collection_id => {
+                actions.push(PendingAction::MoveFolder {
+                    collection: c,
+                    from_path,
+                    id,
+                    to_path: Vec::new(),
+                    before_id: None,
+                });
+            }
+            // Cross-collection drag-and-drop isn't supported.
+            _ => {}
+        }
+    }
+
+    zone.response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *renaming = Some((collection_id, name.to_string()));
+            ui.close();
+        }
+        if ui.button("Edit").clicked() {
+            actions.push(PendingAction::EditCollection(collection_id));
+            ui.close();
+        }
+        if ui.button("Duplicate").clicked() {
+            actions.push(PendingAction::DuplicateCollection(collection_id));
+            ui.close();
+        }
+        if ui.button("Delete").clicked() {
+            actions.push(PendingAction::DeleteCollection(collection_id));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Export").clicked() {
+            actions.push(PendingAction::ExportCollection(collection_id));
+            ui.close();
+        }
+        if ui.button("Run").clicked() {
+            actions.push(PendingAction::RunCollection {
+                collection: collection_id,
+                name: name.to_string(),
             });
+            ui.close();
         }
+        ui.separator();
+        if ui.button("+ Request").clicked() {
+            actions.push(PendingAction::AddRequest {
+                collection: collection_id,
+                folder_path: Vec::new(),
+            });
+            ui.close();
+        }
+        if ui.button("+ Folder").clicked() {
+            actions.push(PendingAction::AddFolder {
+                collection: collection_id,
+                folder_path: Vec::new(),
+            });
+            ui.close();
+        }
+    });
+}
 
-        zone.response.context_menu(|ui| {
-            if ui.button("Rename").clicked() {
-                *renaming = Some((req_id, req.name.clone()));
-                ui.close();
-            }
-            if ui.button("Duplicate").clicked() {
-                actions.push(PendingAction::DuplicateRequest {
-                    collection: collection_id,
-                    folder_path: path.to_vec(),
-                    id: req_id,
-                });
-                ui.close();
-            }
-            if ui.button("Delete").clicked() {
-                actions.push(PendingAction::DeleteRequest {
-                    collection: collection_id,
-                    folder_path: path.to_vec(),
-                    id: req_id,
-                });
-                ui.close();
-            }
-        });
-    }
+#[allow(clippy::too_many_arguments)]
+fn render_folder_row(
+    ui: &mut egui::Ui,
+    collection_id: Uuid,
+    parent_path: &[Uuid],
+    folder_id: Uuid,
+    name: &str,
+    expanded: &mut std::collections::HashSet<Uuid>,
+    renaming: &mut Option<(Uuid, String)>,
+    actions: &mut Vec<PendingAction>,
+) {
+    let mut child_path = parent_path.to_vec();
+    child_path.push(folder_id);
+    let payload = DragPayload::Folder {
+        collection: collection_id,
+        parent_path: parent_path.to_vec(),
+        id: folder_id,
+    };
+    let drag_id = egui::Id::new(("folder-row", collection_id, parent_path.to_vec(), folder_id));
 
-    for folder in folders.iter_mut() {
-        let folder_id = folder.id;
-        let mut child_path = path.to_vec();
-        child_path.push(folder_id);
-        let payload = DragPayload::Folder {
-            collection: collection_id,
-            parent_path: path.to_vec(),
-            id: folder_id,
-        };
-        let drag_id = egui::Id::new(("folder-handle", collection_id, path.to_vec(), folder_id));
-
-        let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
-            if renaming.as_ref().is_some_and(|(id, _)| *id == folder_id) {
-                let (_, buf) = renaming.as_mut().unwrap();
-                let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(160.0));
-                if resp.lost_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let new_name = buf.trim().to_string();
-                        if !new_name.is_empty() {
-                            actions.push(PendingAction::Rename {
-                                id: folder_id,
-                                new_name,
-                            });
-                        }
-                    }
-                    *renaming = None;
-                } else {
-                    resp.request_focus();
-                }
-            } else {
-                // A dedicated drag handle, drawn regardless of whether the
-                // header below is expanded or collapsed — the header itself
-                // isn't a drag source since `CollapsingHeader` draws its own
-                // row internally and can't be wrapped by `dnd_drag_source`.
-                ui.horizontal(|ui| {
-                    ui.dnd_drag_source(drag_id, payload.clone(), |ui| {
-                        // Plain ASCII, not an icon glyph: egui's bundled font
-                        // only covers a specific emoji subset (confirmed by
-                        // the ⭳/⭱ mislabel caught in Phase 2's snapshot) —
-                        // rather than guess at another glyph, this is
-                        // guaranteed to render everywhere.
-                        ui.weak("::: drag");
-                    });
-                });
-                egui::CollapsingHeader::new(&folder.name)
-                    .id_salt(folder_id)
-                    // See the collection header's own comment above — same
-                    // "collapsed by default" fix, one level down.
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("+ request").clicked() {
-                                actions.push(PendingAction::AddRequest {
-                                    collection: collection_id,
-                                    folder_path: child_path.clone(),
-                                });
-                            }
-                            if ui.small_button("+ folder").clicked() {
-                                actions.push(PendingAction::AddFolder {
-                                    collection: collection_id,
-                                    folder_path: child_path.clone(),
-                                });
-                            }
+    let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+        if renaming.as_ref().is_some_and(|(id, _)| *id == folder_id) {
+            let (_, buf) = renaming.as_mut().unwrap();
+            let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(160.0));
+            if resp.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let new_name = buf.trim().to_string();
+                    if !new_name.is_empty() {
+                        actions.push(PendingAction::Rename {
+                            id: folder_id,
+                            new_name,
                         });
-                        folder_contents(
-                            ui,
-                            collection_id,
-                            &child_path,
-                            &mut folder.requests,
-                            &mut folder.folders,
-                            active_id,
-                            open_ids,
-                            false,
-                            renaming,
-                            actions,
-                        );
-                    });
+                    }
+                }
+                *renaming = None;
+            } else {
+                resp.request_focus();
             }
-        });
-
-        if let Some(dropped) = dropped {
-            match (*dropped).clone() {
-                DragPayload::Request {
-                    collection: c,
-                    folder_path: from_path,
-                    id,
-                } if c == collection_id => {
-                    actions.push(PendingAction::MoveRequest {
-                        collection: c,
-                        from_path,
-                        id,
-                        to_path: child_path.clone(),
-                        before_id: None,
-                    });
+        } else {
+            // A dedicated drag handle, separate from the expand toggle and
+            // label — wrapping the whole row would intercept plain clicks
+            // (the same click-through-drag-source bug fixed twice already
+            // this project, Phases 3/8).
+            ui.dnd_drag_source(drag_id, payload.clone(), |ui| {
+                ui.weak("::");
+            });
+            let is_open = expanded.contains(&folder_id);
+            let toggle_clicked = ui.small_button(if is_open { "v" } else { ">" }).clicked();
+            // The name is also clickable and toggles the same state — see
+            // the collection row's identical treatment for why.
+            let name_clicked = ui
+                .add(egui::Button::new(name).truncate().frame(false))
+                .clicked();
+            if toggle_clicked || name_clicked {
+                if is_open {
+                    expanded.remove(&folder_id);
+                } else {
+                    expanded.insert(folder_id);
                 }
-                DragPayload::Folder {
-                    collection: c,
-                    parent_path: from_path,
-                    id,
-                } if c == collection_id && id != folder_id => {
-                    actions.push(PendingAction::MoveFolder {
-                        collection: c,
-                        from_path,
-                        id,
-                        to_path: child_path.clone(),
-                        before_id: None,
-                    });
-                }
-                _ => {} // cross-collection drops, and dropping a folder onto itself, are no-ops
             }
         }
+    });
 
-        zone.response.context_menu(|ui| {
-            if ui.button("Rename").clicked() {
-                *renaming = Some((folder_id, folder.name.clone()));
-                ui.close();
-            }
-            if ui.button("Edit").clicked() {
-                actions.push(PendingAction::EditFolder {
-                    collection: collection_id,
-                    folder_path: child_path.clone(),
+    if let Some(dropped) = dropped {
+        match (*dropped).clone() {
+            DragPayload::Request {
+                collection: c,
+                folder_path: from_path,
+                id,
+            } if c == collection_id => {
+                actions.push(PendingAction::MoveRequest {
+                    collection: c,
+                    from_path,
+                    id,
+                    to_path: child_path.clone(),
+                    before_id: None,
                 });
-                ui.close();
             }
-            if ui.button("Duplicate").clicked() {
-                actions.push(PendingAction::DuplicateFolder {
-                    collection: collection_id,
-                    parent_path: path.to_vec(),
-                    id: folder_id,
+            DragPayload::Folder {
+                collection: c,
+                parent_path: from_path,
+                id,
+            } if c == collection_id && id != folder_id => {
+                actions.push(PendingAction::MoveFolder {
+                    collection: c,
+                    from_path,
+                    id,
+                    to_path: child_path.clone(),
+                    before_id: None,
                 });
-                ui.close();
             }
-            if ui.button("Delete").clicked() {
-                actions.push(PendingAction::DeleteFolder {
+            _ => {} // cross-collection drops, and dropping a folder onto itself, are no-ops
+        }
+    }
+
+    zone.response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *renaming = Some((folder_id, name.to_string()));
+            ui.close();
+        }
+        if ui.button("Edit").clicked() {
+            actions.push(PendingAction::EditFolder {
+                collection: collection_id,
+                folder_path: child_path.clone(),
+            });
+            ui.close();
+        }
+        if ui.button("Duplicate").clicked() {
+            actions.push(PendingAction::DuplicateFolder {
+                collection: collection_id,
+                parent_path: parent_path.to_vec(),
+                id: folder_id,
+            });
+            ui.close();
+        }
+        if ui.button("Delete").clicked() {
+            actions.push(PendingAction::DeleteFolder {
+                collection: collection_id,
+                parent_path: parent_path.to_vec(),
+                id: folder_id,
+            });
+            ui.close();
+        }
+        if ui.button("Run folder").clicked() {
+            actions.push(PendingAction::RunFolder {
+                collection: collection_id,
+                folder_path: child_path.clone(),
+                name: name.to_string(),
+            });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("+ Request").clicked() {
+            actions.push(PendingAction::AddRequest {
+                collection: collection_id,
+                folder_path: child_path.clone(),
+            });
+            ui.close();
+        }
+        if ui.button("+ Folder").clicked() {
+            actions.push(PendingAction::AddFolder {
+                collection: collection_id,
+                folder_path: child_path.clone(),
+            });
+            ui.close();
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_request_row(
+    ui: &mut egui::Ui,
+    collection_id: Uuid,
+    folder_path: &[Uuid],
+    req_id: Uuid,
+    name: &str,
+    method: Option<Method>,
+    hotkey: Option<char>,
+    active_id: Uuid,
+    open_ids: &std::collections::HashSet<Uuid>,
+    renaming: &mut Option<(Uuid, String)>,
+    actions: &mut Vec<PendingAction>,
+) {
+    let payload = DragPayload::Request {
+        collection: collection_id,
+        folder_path: folder_path.to_vec(),
+        id: req_id,
+    };
+    let drag_id = egui::Id::new(("req-row", collection_id, folder_path.to_vec(), req_id));
+
+    let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+        // A dedicated drag handle, separate from the selectable label below
+        // — wrapping the whole row in `dnd_drag_source` (as an earlier
+        // version did) intercepts plain clicks before the label's own
+        // click-sense ever sees them.
+        ui.dnd_drag_source(drag_id, payload.clone(), |ui| {
+            ui.weak("::");
+        });
+
+        if renaming.as_ref().is_some_and(|(id, _)| *id == req_id) {
+            let (_, buf) = renaming.as_mut().unwrap();
+            let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(160.0));
+            if resp.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let new_name = buf.trim().to_string();
+                    if !new_name.is_empty() {
+                        actions.push(PendingAction::Rename {
+                            id: req_id,
+                            new_name,
+                        });
+                    }
+                }
+                *renaming = None;
+            } else {
+                resp.request_focus();
+            }
+        } else {
+            if let Some(method) = method {
+                ui.label(method.as_str());
+            }
+            if let Some(key) = hotkey {
+                ui.weak(format!("[{key}]"));
+            }
+            // A small marker for "open in some other tab" — the active
+            // tab's own row still gets the full `selectable_label`
+            // highlight below. Real-world imported requests can have very
+            // long names (and, occasionally, literal embedded newlines
+            // from a multi-line Postman description mistakenly used as the
+            // name) — sanitizing the newline and truncating with an
+            // ellipsis keeps one long name from stretching the row past
+            // the sidebar's width.
+            let display_name = name.replace('\n', " ");
+            let label = if req_id != active_id && open_ids.contains(&req_id) {
+                format!("• {display_name}")
+            } else {
+                display_name
+            };
+            if ui
+                .add(egui::Button::selectable(req_id == active_id, label).truncate())
+                .clicked()
+            {
+                actions.push(PendingAction::Load {
                     collection: collection_id,
-                    parent_path: path.to_vec(),
-                    id: folder_id,
+                    folder_path: folder_path.to_vec(),
+                    id: req_id,
                 });
-                ui.close();
             }
-            if ui.button("Run folder").clicked() {
-                actions.push(PendingAction::RunFolder {
-                    collection: collection_id,
-                    folder_path: child_path.clone(),
-                    name: folder.name.clone(),
-                });
-                ui.close();
-            }
+        }
+    });
+
+    if let Some(dropped) = dropped
+        && let DragPayload::Request {
+            collection: c,
+            folder_path: from_path,
+            id,
+        } = (*dropped).clone()
+        && c == collection_id
+    {
+        actions.push(PendingAction::MoveRequest {
+            collection: c,
+            from_path,
+            id,
+            to_path: folder_path.to_vec(),
+            before_id: Some(req_id),
         });
     }
+
+    zone.response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *renaming = Some((req_id, name.to_string()));
+            ui.close();
+        }
+        if ui.button("Duplicate").clicked() {
+            actions.push(PendingAction::DuplicateRequest {
+                collection: collection_id,
+                folder_path: folder_path.to_vec(),
+                id: req_id,
+            });
+            ui.close();
+        }
+        if ui.button("Delete").clicked() {
+            actions.push(PendingAction::DeleteRequest {
+                collection: collection_id,
+                folder_path: folder_path.to_vec(),
+                id: req_id,
+            });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Assign hotkey…").clicked() {
+            actions.push(PendingAction::AssignHotkey(req_id));
+            ui.close();
+        }
+    });
 }
 
 /// Recursive rename-by-id search through a folder subtree (used by
@@ -4664,6 +5273,22 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, accessible_label: &str) -> egui::R
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label)
     });
     response
+}
+
+/// A native "delete this?" confirmation — blocking, same established
+/// pattern as `rfd::FileDialog` (and `close_tab_with_confirmation`'s own
+/// dialog) elsewhere in this file. Used before every destructive delete
+/// (collection/folder/request/environment/history) — deliberately *not*
+/// used for a single key-value table row (removing one header/param is a
+/// frequent, low-stakes, easily-redone edit, not the kind of data loss this
+/// is for).
+fn confirm_delete(what: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Delete?")
+        .set_description(format!("Delete {what}? This can't be undone."))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
 
 /// One-line summary for `App::import_message` after an import: clean if
@@ -4961,38 +5586,113 @@ impl eframe::App for App {
             self.resize_settle_deadline = Some(std::time::Instant::now() + settle);
             ui.ctx().request_repaint_after(settle);
         }
-        // Cmd/Ctrl+K is the primary command-palette trigger; Alt+Space is
-        // kept as a second binding rather than replaced — the original
-        // request-only quick-open shortcut still works exactly as before,
-        // it just now opens the wider palette.
-        let toggle_palette = ui
-            .input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Space))
-            || ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
-        if toggle_palette {
-            self.search_open = !self.search_open;
-            if self.search_open {
-                self.search_query.clear();
-                self.search_needs_focus = true;
+        // Leader-key palette trigger: Space (only when nothing has
+        // keyboard focus — otherwise it's just a literal space in whatever
+        // text field is focused), then a matching sequence from
+        // `LEADER_CHORDS` (today just "sf"). Replaces the old Alt+Space/
+        // Cmd+K bindings outright, per explicit user preference.
+        if ui.ctx().memory(|m| m.focused().is_none()) {
+            if self
+                .leader_deadline
+                .is_some_and(|deadline| std::time::Instant::now() > deadline)
+            {
+                self.leader_buffer.clear();
+                self.leader_deadline = None;
+            }
+            if self.leader_buffer.is_empty() {
+                if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                    self.leader_buffer.push(' ');
+                    self.leader_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+                }
+            } else {
+                for c in ('a'..='z').chain('0'..='9') {
+                    let Some(key) = key_for_char(c) else {
+                        continue;
+                    };
+                    if !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                        continue;
+                    }
+                    let mut candidate = self.leader_buffer.clone();
+                    candidate.push(c);
+                    if let Some((_, action)) =
+                        LEADER_CHORDS.iter().find(|(seq, _)| *seq == candidate)
+                    {
+                        match action {
+                            LeaderAction::OpenPalette => {
+                                self.search_open = !self.search_open;
+                                if self.search_open {
+                                    self.search_query.clear();
+                                    self.search_needs_focus = true;
+                                    self.palette_selected = 0;
+                                }
+                            }
+                        }
+                        self.leader_buffer.clear();
+                        self.leader_deadline = None;
+                    } else if LEADER_CHORDS
+                        .iter()
+                        .any(|(seq, _)| seq.starts_with(candidate.as_str()))
+                    {
+                        self.leader_buffer = candidate;
+                        self.leader_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+                    } else {
+                        // Not a prefix of anything recognized — abandon
+                        // silently, matching how neovim drops an
+                        // unrecognized leader sequence.
+                        self.leader_buffer.clear();
+                        self.leader_deadline = None;
+                    }
+                    break;
+                }
             }
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.renaming.is_some() {
             self.renaming = None;
         }
-        const NUMBER_KEYS: [egui::Key; 9] = [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-            egui::Key::Num6,
-            egui::Key::Num7,
-            egui::Key::Num8,
-            egui::Key::Num9,
-        ];
-        for (i, key) in NUMBER_KEYS.into_iter().enumerate() {
-            if ui.input_mut(|inp| inp.consume_key(egui::Modifiers::ALT, key)) {
-                self.open_saved_request(i);
-                break;
+        // AeroSpace-style hotkeys: assign any request to a `0`-`9`/`a`-`z`
+        // key (sidebar context menu, "Assign hotkey…"), then Option/Alt+key
+        // jumps straight to it from anywhere in the app.
+        if let Some(request_id) = self.pending_hotkey_assignment {
+            // Capturing the *next raw key* (no modifier) while the
+            // "press a key to assign" banner is showing — not a hotkey
+            // trigger itself, so this branch and the execution one below
+            // are mutually exclusive per frame.
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.pending_hotkey_assignment = None;
+            } else {
+                for c in HOTKEY_CHARS.chars() {
+                    if let Some(key) = key_for_char(c)
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
+                    {
+                        // A request/key can only be single-mapped — drop
+                        // any prior key this same request held before
+                        // giving it the new one.
+                        self.data.hotkey_bindings.retain(|_, id| *id != request_id);
+                        self.data.hotkey_bindings.insert(c, request_id);
+                        self.pending_hotkey_assignment = None;
+                        // `App::save` (not `self.save()`): inside `impl
+                        // eframe::App for App`'s own `fn ui`, a bare
+                        // `self.save()` resolves to the trait's own
+                        // `eframe::App::save(&mut self, storage)` (an
+                        // unrelated eframe lifecycle hook this app doesn't
+                        // use), not this file's own `App::save(&self)` —
+                        // the fully-qualified call sidesteps the ambiguity.
+                        App::save(self);
+                        break;
+                    }
+                }
+            }
+        } else {
+            for c in HOTKEY_CHARS.chars() {
+                if let Some(key) = key_for_char(c)
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key))
+                    && let Some(&request_id) = self.data.hotkey_bindings.get(&c)
+                {
+                    self.open_request_by_id(request_id);
+                    break;
+                }
             }
         }
         // Cmd/Ctrl+T / Cmd/Ctrl+W are safe cross-platform (apps commonly
@@ -5005,9 +5705,19 @@ impl eframe::App for App {
             self.new_blank_tab();
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
-            self.close_tab(self.active_tab);
+            self.close_tab_with_confirmation(self.active_tab);
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        }
+        // AeroSpace's own `alt-h`/`alt-l` convention for "focus the
+        // window to the left/right" — same idea, one tab over. `j`/`k`
+        // (the rest of that row) are deliberately left unbound; see
+        // `HOTKEY_CHARS`'s own comment for why.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::H)) {
+            self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::L)) {
             self.active_tab = (self.active_tab + 1) % self.tabs.len();
         }
         // Matches the existing "Save" button/`save_current_request`, same
@@ -5107,16 +5817,96 @@ mod tests {
         // this test, whose whole point is demonstrating the nested-folder
         // indentation, has to click each header open first.
         harness.get_by_label("Demo").click();
+        // Two steps, not one: `collections_sidebar` flattens the tree into
+        // `rows` once at the top of the frame, *before* the `show_rows`
+        // loop that actually processes this click and mutates
+        // `expanded_nodes` — so the newly-expanded row(s) don't appear
+        // until the *next* frame's flattening picks up the updated state.
+        // Same class of "layout needs one more frame to settle" quirk this
+        // codebase has already hit with `CollapsingHeader` animations and a
+        // freshly-opened `egui::Window` (Phase 11) — not a real bug, just
+        // an artifact of single-stepping a headless harness through what a
+        // live, continuously-repainting app resolves in well under a frame.
         harness.step();
-        // `get_all_by_label` (not `get_by_label`) here: `kittest`'s
-        // accessibility tree transiently exposes more than one "Auth"-
-        // labeled node while `CollapsingHeader`'s open animation is still
-        // settling from the "Demo" click above — clicking the first match
-        // is enough (this is a test-harness quirk, not something a real
-        // user querying by mouse position would ever hit).
+        harness.step();
         harness.get_all_by_label("Auth").next().unwrap().click();
+        // Same one-more-frame reasoning as the "Demo" click above.
+        harness.step();
         harness.step();
         harness.snapshot("phase3_nested_folders");
+    }
+
+    /// "Expand all"/"Collapse all" should reveal/hide a deeply-nested
+    /// request in one click each, without needing to open every ancestor
+    /// folder by hand — the actual feature this test exercises, not just a
+    /// static render.
+    #[test]
+    #[ignore]
+    fn expand_all_and_collapse_all_toggle_the_whole_tree() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+
+        let mut tokens = Folder::new("Tokens");
+        tokens.requests.push(RequestItem::new("Refresh Token"));
+
+        let mut auth = Folder::new("Auth");
+        auth.folders.push(tokens);
+
+        collection.folders.push(auth);
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        // Collapsed by default: a request two folders deep isn't visible
+        // (or clickable) at all yet.
+        assert!(
+            harness.query_by_label("Refresh Token").is_none(),
+            "starts collapsed — the deeply-nested request shouldn't be visible yet"
+        );
+
+        harness.get_by_label("Expand all").click();
+        harness.step();
+        assert!(
+            harness.query_by_label("Refresh Token").is_some(),
+            "\"Expand all\" should reveal every nested folder in one click"
+        );
+
+        harness.get_by_label("Collapse all").click();
+        harness.step();
+        assert!(
+            harness.query_by_label("Refresh Token").is_none(),
+            "\"Collapse all\" should hide it again"
+        );
+    }
+
+    /// The sidebar's "Add sample requests" button is the self-service
+    /// replacement for hand-seeding a demo collection — clicking it should
+    /// add a real `Collection::sample()` and persist it, same as any other
+    /// mutating sidebar action.
+    #[test]
+    #[ignore]
+    fn clicking_add_sample_requests_button_adds_the_collection() {
+        use egui_kittest::kittest::Queryable;
+
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+        assert!(harness.state().data.collections.is_empty());
+
+        harness.get_by_label("🧪 Add sample requests").click();
+        harness.step();
+
+        assert_eq!(harness.state().data.collections.len(), 1);
+        assert_eq!(harness.state().data.collections[0].name, "Sample Requests");
+        // Also actually visible in the sidebar, not just in `self.data`.
+        assert!(harness.query_by_label("Sample Requests").is_some());
     }
 
     /// Regression test for a real click-through-drag-source bug: an earlier
@@ -5154,6 +5944,17 @@ mod tests {
         // comment near `collections_sidebar` for why) — expand "Demo" first
         // so "Get Users" is actually rendered to click.
         harness.get_by_label("Demo").click();
+        // Two steps, not one: `collections_sidebar` flattens the tree into
+        // `rows` once at the top of the frame, *before* the `show_rows`
+        // loop that actually processes this click and mutates
+        // `expanded_nodes` — so the newly-expanded row(s) don't appear
+        // until the *next* frame's flattening picks up the updated state.
+        // Same class of "layout needs one more frame to settle" quirk this
+        // codebase has already hit with `CollapsingHeader` animations and a
+        // freshly-opened `egui::Window` (Phase 11) — not a real bug, just
+        // an artifact of single-stepping a headless harness through what a
+        // live, continuously-repainting app resolves in well under a frame.
+        harness.step();
         harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
@@ -5504,6 +6305,57 @@ mod tests {
         );
     }
 
+    /// Anyone who already relied on the old Alt+1..9-opens-"Saved Requests"
+    /// shortcut should see the exact same requests still bound to the same
+    /// keys once this feature replaces it — `App::with_data` (via
+    /// `with_data_settings_and_jar`) runs this migration on construction.
+    #[test]
+    fn migrate_number_shortcuts_to_hotkey_bindings_preserves_alt_1_through_9() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Saved Requests");
+        let ids: Vec<Uuid> = (0..12)
+            .map(|i| {
+                let req = RequestItem::new(format!("Req {i}"));
+                let id = req.id;
+                collection.requests.push(req);
+                id
+            })
+            .collect();
+        data.collections.push(collection);
+
+        let app = App::with_data(data);
+
+        for (i, id) in ids.iter().enumerate().take(9) {
+            let key = char::from_digit(i as u32 + 1, 10).unwrap();
+            assert_eq!(
+                app.data.hotkey_bindings.get(&key),
+                Some(id),
+                "request {i} should keep the Alt+{key} binding it had before"
+            );
+        }
+        // Only the first 9 (Alt+1..9 only ever covered 9 slots) — the 10th
+        // and beyond get no automatic binding.
+        assert_eq!(app.data.hotkey_bindings.len(), 9);
+    }
+
+    #[test]
+    fn migration_is_a_no_op_once_any_hotkey_already_exists() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Saved Requests");
+        collection.requests.push(RequestItem::new("Req"));
+        data.collections.push(collection);
+        // Simulates a user who already assigned one hotkey (to some
+        // unrelated request) before this exact "Saved Requests" collection
+        // existed in their data — the migration must not clobber it.
+        let unrelated_id = Uuid::new_v4();
+        data.hotkey_bindings.insert('z', unrelated_id);
+
+        let app = App::with_data(data);
+
+        assert_eq!(app.data.hotkey_bindings.len(), 1);
+        assert_eq!(app.data.hotkey_bindings.get(&'z'), Some(&unrelated_id));
+    }
+
     /// The concrete regression guard for the concurrency bug this phase
     /// fixes: previously there was only one global `in_flight_id`, so a
     /// second tab's send would silently drop the first tab's reply once it
@@ -5566,6 +6418,68 @@ mod tests {
         );
     }
 
+    /// Every completed send — success or failure — should show up in the
+    /// Console, newest first, regardless of which tab it came from.
+    #[test]
+    fn poll_responses_records_a_console_entry_for_every_send() {
+        let mut app = App::with_data(AppData::default());
+        let id = app.tabs[0].in_flight_id;
+        app.tabs[0].is_loading = true;
+        app.tabs[0].current_request.url = "https://example.com/ok".to_string();
+
+        app.tx
+            .send((
+                id,
+                RequestOutcome::Success {
+                    request: SentRequest {
+                        method: "GET".to_string(),
+                        url: "https://example.com/ok".to_string(),
+                        headers: vec![],
+                        body: None,
+                    },
+                    response: HttpResponse {
+                        status: 200,
+                        status_text: "OK".to_string(),
+                        headers: vec![],
+                        body: "{}".to_string(),
+                        duration_ms: 9,
+                        size_bytes: 2,
+                        raw_bytes: Vec::new(),
+                    },
+                },
+            ))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        app.poll_responses(&ctx);
+
+        assert_eq!(app.console.len(), 1);
+        assert_eq!(app.console[0].url, "https://example.com/ok");
+        assert_eq!(app.console[0].status, Some(200));
+
+        // A second send (a failure this time) is inserted at the front —
+        // newest first, matching `data.history`'s own convention.
+        let id2 = app.tabs[0].in_flight_id;
+        app.tabs[0].is_loading = true;
+        app.tabs[0].current_request.url = "https://example.com/bad".to_string();
+        app.tx
+            .send((
+                id2,
+                RequestOutcome::Error {
+                    request: None,
+                    message: "boom".to_string(),
+                    duration_ms: None,
+                },
+            ))
+            .unwrap();
+        app.poll_responses(&ctx);
+
+        assert_eq!(app.console.len(), 2);
+        assert_eq!(app.console[0].url, "https://example.com/bad");
+        assert_eq!(app.console[0].error.as_deref(), Some("boom"));
+        assert_eq!(app.console[1].url, "https://example.com/ok");
+    }
+
     /// Phase 8 self-check: clicking a sidebar request opens it in a new tab
     /// (rather than replacing whatever was open), and closing that tab
     /// leaves the original blank tab behind.
@@ -5587,6 +6501,17 @@ mod tests {
 
         // Collections start collapsed by default — expand "Demo" first.
         harness.get_by_label("Demo").click();
+        // Two steps, not one: `collections_sidebar` flattens the tree into
+        // `rows` once at the top of the frame, *before* the `show_rows`
+        // loop that actually processes this click and mutates
+        // `expanded_nodes` — so the newly-expanded row(s) don't appear
+        // until the *next* frame's flattening picks up the updated state.
+        // Same class of "layout needs one more frame to settle" quirk this
+        // codebase has already hit with `CollapsingHeader` animations and a
+        // freshly-opened `egui::Window` (Phase 11) — not a real bug, just
+        // an artifact of single-stepping a headless harness through what a
+        // live, continuously-repainting app resolves in well under a frame.
+        harness.step();
         harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
@@ -5632,6 +6557,17 @@ mod tests {
 
         // Collections start collapsed by default — expand "Demo" first.
         harness.get_by_label("Demo").click();
+        // Two steps, not one: `collections_sidebar` flattens the tree into
+        // `rows` once at the top of the frame, *before* the `show_rows`
+        // loop that actually processes this click and mutates
+        // `expanded_nodes` — so the newly-expanded row(s) don't appear
+        // until the *next* frame's flattening picks up the updated state.
+        // Same class of "layout needs one more frame to settle" quirk this
+        // codebase has already hit with `CollapsingHeader` animations and a
+        // freshly-opened `egui::Window` (Phase 11) — not a real bug, just
+        // an artifact of single-stepping a headless harness through what a
+        // live, continuously-repainting app resolves in well under a frame.
+        harness.step();
         harness.step();
 
         // Open "Get Users" in a second tab — it becomes active, leaving the
@@ -5679,12 +6615,73 @@ mod tests {
 
         // Collections start collapsed by default — expand "Demo" first.
         harness.get_by_label("Demo").click();
+        // Two steps, not one: `collections_sidebar` flattens the tree into
+        // `rows` once at the top of the frame, *before* the `show_rows`
+        // loop that actually processes this click and mutates
+        // `expanded_nodes` — so the newly-expanded row(s) don't appear
+        // until the *next* frame's flattening picks up the updated state.
+        // Same class of "layout needs one more frame to settle" quirk this
+        // codebase has already hit with `CollapsingHeader` animations and a
+        // freshly-opened `egui::Window` (Phase 11) — not a real bug, just
+        // an artifact of single-stepping a headless harness through what a
+        // live, continuously-repainting app resolves in well under a frame.
+        harness.step();
         harness.step();
         harness.get_by_label("Get Users").click();
         harness.step();
         harness.get_by_label("Create Order").click();
         harness.step();
         harness.snapshot("phase8_tab_bar");
+    }
+
+    /// Option+H/L (AeroSpace's own "focus left/right" convention) steps
+    /// between open tabs, wrapping at both ends — driven by a real injected
+    /// key event, not just calling the underlying field mutation directly.
+    #[test]
+    #[ignore]
+    fn option_h_and_l_step_between_open_tabs() {
+        let mut app = App::with_data(AppData::default());
+        app.new_blank_tab();
+        app.new_blank_tab();
+        assert_eq!(app.tabs.len(), 3);
+        app.active_tab = 1;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| app);
+        harness.step();
+
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::L);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            2,
+            "Option+L moves to the next tab"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::L);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            0,
+            "Option+L wraps around past the last tab"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::H);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            2,
+            "Option+H wraps back around past the first tab"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::H);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            1,
+            "Option+H moves to the previous tab"
+        );
     }
 
     #[test]
@@ -5900,6 +6897,53 @@ mod tests {
         harness.snapshot("phase9_runner_panel");
     }
 
+    /// Phase 15 self-check: the Console panel lists seeded entries
+    /// (success with script log + passing test, and a failure), newest
+    /// first in storage but rendered oldest-first (top-to-bottom, like a
+    /// real terminal log).
+    #[test]
+    #[ignore]
+    fn egui_kittest_smoke_renders_console_panel() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        {
+            let state = harness.state_mut();
+            state.console = vec![
+                ConsoleEntry {
+                    timestamp: chrono::Utc::now(),
+                    method: Method::Post,
+                    url: "https://example.com/orders".to_string(),
+                    status: None,
+                    duration_ms: None,
+                    error: Some("connection refused".to_string()),
+                    script_log: vec![],
+                    test_results: vec![],
+                },
+                ConsoleEntry {
+                    timestamp: chrono::Utc::now(),
+                    method: Method::Get,
+                    url: "https://example.com/users".to_string(),
+                    status: Some(200),
+                    duration_ms: Some(12),
+                    error: None,
+                    script_log: vec!["fetched data".to_string()],
+                    test_results: vec![TestResult {
+                        name: "status is 200".to_string(),
+                        passed: true,
+                        error: None,
+                    }],
+                },
+            ];
+            state.central_view = CentralView::Console;
+        }
+        harness.step();
+        harness.snapshot("phase15_console_panel");
+    }
+
     /// Manual/CI-network verification of the actual threading design (the
     /// riskiest part of this phase): `start_run`'s background thread does a
     /// real HTTP round trip via `handle.block_on(...)` on a plain
@@ -6017,6 +7061,36 @@ mod tests {
         assert!(matching.iter().all(|label| label.starts_with("Theme:")));
     }
 
+    /// The concrete fix for "fuzzy chưa ngon như fzf": a non-contiguous
+    /// subsequence like `"crq"` should match `"Create Request"` (every
+    /// character appears in order, just not adjacently) — something the
+    /// old plain `.contains()` substring check could never do — and a
+    /// tighter/earlier match should score higher than a looser one.
+    #[test]
+    fn fuzzy_score_matches_non_contiguous_subsequences_and_ranks_tighter_matches_higher() {
+        let mut matcher = nucleo_matcher::Matcher::default();
+
+        let tight = fuzzy_score(&mut matcher, "Create Request", "crq");
+        assert!(
+            tight.is_some(),
+            "\"crq\" should subsequence-match \"Create Request\""
+        );
+
+        // A plain substring check would never match this at all — "xyz"
+        // doesn't literally appear anywhere in "Create Request".
+        assert!(fuzzy_score(&mut matcher, "Create Request", "xyz").is_none());
+
+        // A name that starts with the query should score at least as well
+        // as one where the same two letters are scattered further apart.
+        let prefix_match = fuzzy_score(&mut matcher, "Create Request", "cr");
+        let scattered_match = fuzzy_score(&mut matcher, "Collection Runner", "cr");
+        assert!(
+            prefix_match.unwrap() >= scattered_match.unwrap(),
+            "a match starting right at the beginning should score at least \
+             as well as one where the same letters are spread further apart"
+        );
+    }
+
     #[test]
     fn perform_palette_action_applies_the_expected_field_change() {
         let mut app = App::with_data(AppData::default());
@@ -6083,6 +7157,107 @@ mod tests {
         harness.step();
         harness.step();
         harness.snapshot("phase11_command_palette");
+    }
+
+    /// The leader-key chord (space, then s, then f) is now the *only* way
+    /// to open the command palette (Alt+Space/Cmd+K were removed outright)
+    /// — driven by real injected key events, not by setting `search_open`
+    /// directly.
+    #[test]
+    #[ignore]
+    fn leader_key_space_s_f_opens_the_command_palette() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+        assert!(!harness.state().search_open);
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.key_press(egui::Key::F);
+        harness.step();
+
+        assert!(
+            harness.state().search_open,
+            "space, then s, then f should open the command palette"
+        );
+    }
+
+    /// An abandoned sequence (a key that isn't a prefix of any known chord)
+    /// resets silently rather than leaving a stale partial match that a
+    /// later, unrelated "s" or "f" keypress could accidentally complete.
+    #[test]
+    #[ignore]
+    fn leader_key_sequence_aborts_on_a_non_matching_key() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::Z); // not "s" — not a prefix of anything
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.key_press(egui::Key::F);
+        harness.step();
+
+        assert!(
+            !harness.state().search_open,
+            "an abandoned chord must not leave a stale partial match behind"
+        );
+    }
+
+    /// The palette had no selection cursor at all before this — Enter
+    /// always picked whatever entry happened to be first, regardless of
+    /// what was visibly highlighted (nothing was). `Ctrl+N`/`Ctrl+P` now
+    /// move one, wrapping at both ends.
+    #[test]
+    #[ignore]
+    fn ctrl_n_and_ctrl_p_move_the_palette_selection_with_wraparound() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Alpha"));
+        collection.requests.push(RequestItem::new("Beta"));
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.state_mut().search_open = true;
+        harness.step();
+        harness.step();
+        assert_eq!(harness.state().palette_selected, 0);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(
+            harness.state().palette_selected,
+            1,
+            "Ctrl+N moves to the next entry"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
+        harness.step();
+        assert_eq!(
+            harness.state().palette_selected,
+            0,
+            "Ctrl+P moves back to the previous entry"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
+        harness.step();
+        assert!(
+            harness.state().palette_selected > 0,
+            "Ctrl+P from the first entry should wrap around to the last one"
+        );
     }
 
     /// The first explicit light-theme baseline in this project — every

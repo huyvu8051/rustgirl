@@ -163,6 +163,41 @@ pub async fn send_request(
             duration_ms: None,
         };
     }
+    // A URL like `{{baseUrl}}/foo` with no active Environment defining
+    // `baseUrl` resolves to nothing — `reqwest` then fails to parse the
+    // literal `{{baseUrl}}/foo` as a URL at all and reports a bare, useless
+    // "builder error" with zero context. Catching this here turns that into
+    // an actual actionable message instead of leaving the user to guess.
+    let unresolved = crate::model::find_unresolved_variables(&url);
+    if !unresolved.is_empty() {
+        let names = unresolved
+            .iter()
+            .map(|v| format!("{{{{{v}}}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return RequestOutcome::Error {
+            request: None,
+            message: format!(
+                "URL still has unresolved variable(s): {names} — check that the right Environment is selected and defines them."
+            ),
+            duration_ms: None,
+        };
+    }
+    // A variable can be *defined* in the active scope but empty (a real
+    // case: several imported Postman environments have a `baseUrl` key
+    // whose value was simply left blank) — `find_unresolved_variables`
+    // above doesn't catch that, since the placeholder *did* get replaced,
+    // just with nothing. Parsing the fully-resolved URL directly catches
+    // this and every other way it could end up malformed, with the actual
+    // resolved string in the message instead of reqwest's bare "builder
+    // error".
+    if let Err(e) = reqwest::Url::parse(&url) {
+        return RequestOutcome::Error {
+            request: None,
+            message: format!("Invalid URL after resolving variables ({e}): {url:?}"),
+            duration_ms: None,
+        };
+    }
 
     let mut req = client.request(item.method.to_reqwest(), &url);
     // A request-level override — `None` means "whatever the `Client`'s own
@@ -587,6 +622,72 @@ mod tests {
                 assert!(!response.raw_bytes.is_empty());
             }
             RequestOutcome::Error { message, .. } => panic!("request failed: {message}"),
+        }
+    }
+
+    /// Regression test for a real reported bug: a URL that resolves to
+    /// `{{baseUrl}}/...` (no active Environment defines `baseUrl`) used to
+    /// fail with a bare "Failed to build request: builder error" — no
+    /// network needed to hit this, it fails before ever reaching `reqwest`
+    /// now, on the unresolved-variable check added right after URL
+    /// resolution.
+    #[test]
+    fn unresolved_url_variable_reports_a_clear_error_instead_of_a_bare_builder_error() {
+        let client = reqwest::Client::new();
+        let mut item = RequestItem::new("example");
+        item.url = "{{baseUrl}}/internal/signature-platform/:enterpriseId".to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // No variable scopes at all — `baseUrl` can't resolve from anywhere.
+        let outcome = rt.block_on(send_request(
+            client,
+            item,
+            Vec::new(),
+            AuthConfig::default(),
+        ));
+        match outcome {
+            RequestOutcome::Error { message, .. } => {
+                assert!(
+                    message.contains("baseUrl") && message.contains("unresolved"),
+                    "expected a clear unresolved-variable message, got: {message:?}"
+                );
+            }
+            RequestOutcome::Success { .. } => panic!("expected this to fail, not succeed"),
+        }
+    }
+
+    /// Regression test for the related, distinct case: `baseUrl` genuinely
+    /// *is* defined in the active scope (so `find_unresolved_variables`
+    /// finds nothing left over) but its value is an empty string — a real
+    /// case hit migrating actual Postman environments, several of which
+    /// have a `baseUrl` key deliberately left blank. Resolves to a bare
+    /// relative path with no scheme, which still isn't a valid URL —
+    /// caught by the `reqwest::Url::parse` check, not the unresolved-
+    /// variable one.
+    #[test]
+    fn url_resolving_to_an_invalid_string_reports_the_resolved_url_not_a_bare_builder_error() {
+        let client = reqwest::Client::new();
+        let mut item = RequestItem::new("example");
+        item.url = "{{baseUrl}}/tenants/:tenantId/document-baskets".to_string();
+        item.path_params.push(KeyValue {
+            key: "tenantId".to_string(),
+            value: "abc123".to_string(),
+            enabled: true,
+        });
+        let scopes = vec![vec![KeyValue {
+            key: "baseUrl".to_string(),
+            value: String::new(),
+            enabled: true,
+        }]];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt.block_on(send_request(client, item, scopes, AuthConfig::default()));
+        match outcome {
+            RequestOutcome::Error { message, .. } => {
+                assert!(
+                    message.contains("Invalid URL") && message.contains("tenants/abc123"),
+                    "expected the resolved (still-invalid) URL in the message, got: {message:?}"
+                );
+            }
+            RequestOutcome::Success { .. } => panic!("expected this to fail, not succeed"),
         }
     }
 }

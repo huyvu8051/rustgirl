@@ -43,7 +43,8 @@
 //! had, just spread across many small files instead of one big one.
 
 use crate::model::{
-    AppData, AuthConfig, Collection, Environment, Folder, HistoryEntry, KeyValue, Settings,
+    AppData, AuthConfig, Collection, ConsoleEntry, Environment, Folder, HistoryEntry, KeyValue,
+    Settings,
 };
 use reqwest_cookie_store::CookieStoreMutex;
 use serde::{Deserialize, Serialize};
@@ -493,6 +494,84 @@ fn load_globals(path: &Path) -> Vec<KeyValue> {
 }
 
 // ---------------------------------------------------------------------------
+// Hotkey bindings
+// ---------------------------------------------------------------------------
+
+fn hotkeys_file(root: &Path) -> PathBuf {
+    root.join("hotkeys.json")
+}
+
+fn save_hotkeys(hotkeys: &std::collections::HashMap<char, Uuid>, path: &Path) {
+    write_json(path, hotkeys);
+}
+
+fn load_hotkeys(path: &Path) -> std::collections::HashMap<char, Uuid> {
+    read_json(path).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Console log — a plain-text troubleshooting trail, deliberately not JSON
+// like everything else in this module: the point is to be readable with
+// `tail -f`/a text editor, not machine-parsed.
+// ---------------------------------------------------------------------------
+
+fn console_log_file(root: &Path) -> PathBuf {
+    root.join("console.log")
+}
+
+/// Renders one `ConsoleEntry` as a readable block and appends it to
+/// `console.log` in the app data root. Never fails loudly — a filesystem
+/// problem writing the *log* shouldn't interrupt the request that's
+/// already completed by the time this runs.
+pub fn append_console_log(entry: &ConsoleEntry) {
+    append_console_log_to(entry, &console_log_file(&root_dir()));
+}
+
+/// The `console.log` file's real path — shown as plain, selectable text in
+/// the Console panel so the user can navigate to it themselves (never
+/// auto-opened; no `Command`/`open` invocation here).
+pub fn console_log_path() -> PathBuf {
+    console_log_file(&root_dir())
+}
+
+fn append_console_log_to(entry: &ConsoleEntry, path: &Path) {
+    use std::io::Write;
+
+    let mut block = format!(
+        "[{}] {} {}\n",
+        entry.timestamp.to_rfc3339(),
+        entry.method.as_str(),
+        entry.url
+    );
+    match (entry.status, &entry.error) {
+        (Some(status), _) => {
+            block.push_str(&format!(
+                "  -> {status}, {}ms\n",
+                entry.duration_ms.unwrap_or_default()
+            ));
+        }
+        (None, Some(err)) => block.push_str(&format!("  -> ERROR: {err}\n")),
+        (None, None) => block.push_str("  -> (no response)\n"),
+    }
+    for line in &entry.script_log {
+        block.push_str(&format!("  console.log: {line}\n"));
+    }
+    if !entry.test_results.is_empty() {
+        let passed = entry.test_results.iter().filter(|t| t.passed).count();
+        block.push_str(&format!("  tests: {passed}/{}\n", entry.test_results.len()));
+    }
+    block.push('\n');
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(block.as_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings and the cookie jar — see the module doc comment for why these
 // are separate from `AppData`'s `load()`/`save()`.
 // ---------------------------------------------------------------------------
@@ -553,6 +632,7 @@ pub fn load() -> AppData {
             environments: load_environments(&environments_dir(&root)),
             history: load_history(&history_dir(&root)),
             globals: load_globals(&globals_file(&root)),
+            hotkey_bindings: load_hotkeys(&hotkeys_file(&root)),
         };
     }
 
@@ -576,6 +656,7 @@ pub fn save(data: &AppData) {
     save_environments(&data.environments, &environments_dir(&root));
     save_history(&data.history, &history_dir(&root));
     save_globals(&data.globals, &globals_file(&root));
+    save_hotkeys(&data.hotkey_bindings, &hotkeys_file(&root));
 }
 
 #[cfg(test)]
@@ -868,6 +949,67 @@ mod tests {
             load_globals(&tmp.0.join("missing.json")),
             Vec::<KeyValue>::new()
         );
+    }
+
+    #[test]
+    fn hotkey_bindings_round_trip() {
+        let tmp = TempDir::new("hotkeys");
+        let mut hotkeys = std::collections::HashMap::new();
+        hotkeys.insert('a', Uuid::new_v4());
+        hotkeys.insert('5', Uuid::new_v4());
+        let path = tmp.0.join("hotkeys.json");
+        save_hotkeys(&hotkeys, &path);
+        assert_eq!(load_hotkeys(&path), hotkeys);
+
+        // Missing file (never saved yet, or an install from before this
+        // feature existed) is an empty map, not an error.
+        assert_eq!(
+            load_hotkeys(&tmp.0.join("missing.json")),
+            std::collections::HashMap::new()
+        );
+    }
+
+    #[test]
+    fn append_console_log_writes_a_readable_block_per_entry() {
+        let tmp = TempDir::new("console-log");
+        let path = tmp.0.join("console.log");
+
+        let success = ConsoleEntry {
+            timestamp: chrono::Utc::now(),
+            method: crate::model::Method::Get,
+            url: "https://example.com/ok".to_string(),
+            status: Some(200),
+            duration_ms: Some(42),
+            error: None,
+            script_log: vec!["hello".to_string()],
+            test_results: vec![crate::model::TestResult {
+                name: "status is 200".to_string(),
+                passed: true,
+                error: None,
+            }],
+        };
+        append_console_log_to(&success, &path);
+
+        let failure = ConsoleEntry {
+            timestamp: chrono::Utc::now(),
+            method: crate::model::Method::Post,
+            url: "https://example.com/bad".to_string(),
+            status: None,
+            duration_ms: None,
+            error: Some("connection refused".to_string()),
+            script_log: vec![],
+            test_results: vec![],
+        };
+        append_console_log_to(&failure, &path);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // Both entries landed in the same file, appended (not overwritten).
+        assert!(contents.contains("GET https://example.com/ok"));
+        assert!(contents.contains("-> 200, 42ms"));
+        assert!(contents.contains("console.log: hello"));
+        assert!(contents.contains("tests: 1/1"));
+        assert!(contents.contains("POST https://example.com/bad"));
+        assert!(contents.contains("-> ERROR: connection refused"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 > Cập nhật theo tiến độ roadmap "100% Postman parity". Xem plan đầy đủ tại
 > `~/.claude/plans/playful-snuggling-orbit.md`. File này chỉ liệt kê tính
-> năng đã xong (Phase 1–6); Phase 7–12 chưa làm.
+> năng đã xong.
 
 ## Phase 1 — Nền tảng data model ✅
 - **Auth block** (`AuthKind`/`AuthConfig`) trên `RequestItem`, `Folder`,
@@ -220,3 +220,53 @@
 - 3 snapshot mới (`egui_kittest`): màn hình edit folder (mô tả + 2 script
   tab), chế độ Bulk Edit, và tiện thể xác nhận field mô tả hiển thị đúng
   trong request editor — không gặp lỗi thiếu icon nào.
+
+## Phase 15 — Điều hướng & quan sát: ảo hóa cây request, phím tắt kiểu
+AeroSpace, command palette leader-key, tab Console ✅
+- **Sửa lỗi thật do người dùng báo**: "Failed to build request: builder
+  error" khi URL dùng `{{baseUrl}}` — giờ báo rõ ràng "biến chưa được thay
+  thế" hoặc "URL sau khi thay biến không hợp lệ" thay vì lỗi mù mờ của
+  reqwest. Tiện thể sửa luôn 2 bug thật phát hiện khi import 21 collection
+  Postman thật của người dùng: script bị đè mất khi có ≥2 event cùng loại,
+  và script rỗng để trống trong Postman bị báo nhầm "cần chuyển tay".
+- **Ảo hóa cây collection** (`show_rows`) — cây được làm phẳng thành danh
+  sách 1 chiều rồi chỉ render các dòng đang hiển thị trên màn hình, hết lag
+  khi mở folder có hàng trăm request. "Expand all"/"Collapse all" giờ thao
+  tác trực tiếp trên state của app thay vì dựa vào bộ nhớ nội bộ của egui.
+  Các nút hành động (thêm request/folder, xóa, export, run) chuyển hết vào
+  menu chuột phải để tương thích với việc render theo dòng cố định chiều
+  cao — vẫn 1 click, chỉ đổi chỗ.
+- **Phím tắt gán request kiểu macOS AeroSpace**: chuột phải vào request →
+  "Assign hotkey…" → bấm 1 phím bất kỳ trong `0-9`/`a-z` (trừ `h j k l` —
+  dành riêng cho điều hướng tab) để gán. Sau đó **Option+phím đó** ở bất
+  kỳ đâu trong app sẽ mở ngay tab request đó. Có badge nhỏ hiện phím đã gán
+  cạnh tên request trong cây. Người dùng cũ đang dùng Alt+1..9 cho "Saved
+  Requests" được tự động migrate sang hệ thống mới, không mất phím tắt cũ.
+- **Option+H / Option+L** để chuyển qua lại giữa các tab đang mở (giống
+  `alt-h`/`alt-l` của AeroSpace) — `j`/`k` cố tình chưa gán, để dành làm gì
+  đó sau.
+- **Command palette đổi cách mở**: thay Alt+Space/Cmd+K bằng chuỗi phím
+  kiểu neovim — khi không có ô nào đang focus, gõ `Space` rồi `s` rồi `f`
+  (`<leader>sf`) sẽ mở palette. Gõ sai phím giữa chừng thì tự hủy; để quá
+  600ms không gõ tiếp cũng tự hủy.
+- **Ctrl+N / Ctrl+P** để di chuyển highlight lên/xuống trong palette (kiểu
+  Emacs), có vòng lặp khi tới đầu/cuối danh sách.
+- **Fuzzy search chuẩn fzf**: thay tìm kiếm theo kiểu "chứa chuỗi con" bằng
+  `nucleo-matcher` (cùng thuật toán fzf) — gõ tắt không liền nhau (ví dụ
+  "crq" ra "Create Request") vẫn tìm ra, và kết quả xếp hạng theo độ khớp
+  thay vì theo thứ tự có sẵn.
+- **Tab Console kiểu Postman** + **ghi log ra file**: mỗi lần gửi request
+  (thành công hay lỗi) đều hiện trong tab Console (status, thời gian,
+  console.log từ script, số test pass/fail) và đồng thời ghi 1 dòng dễ đọc
+  vào file `console.log` trên đĩa — để troubleshoot cả sau khi đóng app.
+  Đường dẫn file log hiện ngay trong tab Console.
+- **Dialog import file giờ chọn được nhiều file cùng lúc** (Postman
+  collection, OpenAPI spec, Postman environment) — import hàng loạt trong
+  1 lần thay vì phải mở dialog lại từng file, kết quả từng file được tóm
+  tắt chung trong 1 dòng thông báo.
+- Chưa làm (ghi nhận riêng, chưa nằm trong phạm vi phase này): nút tắt/mở
+  sidebar tự động thu gọn khi cửa sổ hẹp lại, và Ctrl+I/Ctrl+O để nhảy tới
+  lui giữa lịch sử các tab đã mở kiểu Vim jumplist.
+- **125 unit test** (từ 108) — thêm test cho việc làm phẳng cây theo từng
+  mức mở, round-trip phím tắt, migration Alt+1..9 cũ, ghi console log, và
+  xếp hạng fuzzy match.
