@@ -555,6 +555,42 @@ pub struct App {
     /// can freeze their wrap width instead of re-laying-out huge bodies on
     /// every single intermediate frame of the drag.
     resize_settle_deadline: Option<std::time::Instant>,
+
+    /// Whether the left sidebar (`sidebar`) renders at all this frame —
+    /// toggled by the top bar's "Hide/Show Sidebar" button, and also
+    /// flipped automatically when the window narrows past
+    /// `SIDEBAR_AUTO_HIDE_WIDTH` (see `sidebar_auto_hidden`/`sidebar_was_narrow`).
+    sidebar_visible: bool,
+    /// `true` exactly when the sidebar is currently hidden *because* the
+    /// window is narrow, not because the user asked for it to be hidden —
+    /// lets widening the window back out restore it automatically, while a
+    /// manual toggle (which always clears this) is never fought by that
+    /// auto-restore.
+    sidebar_auto_hidden: bool,
+    /// Last frame's narrow/wide bucket, so the auto-hide/auto-restore check
+    /// is edge-triggered (fires once on the transition) instead of forcing
+    /// `sidebar_visible` every single frame the window happens to be narrow
+    /// — which would fight a manual re-open while still narrow.
+    sidebar_was_narrow: bool,
+
+    /// Every tab (by its request's own id, stable for the tab's lifetime)
+    /// the user has actually landed on, in visiting order — a Vim-jumplist-
+    /// style back/forth history, not just a plain "most recent" stack.
+    /// Appended to once per frame whenever the active tab ends up
+    /// different from whatever's already recorded at `tab_jump_cursor`
+    /// (see the end of `fn ui`) — covers every way the active tab can
+    /// change (clicking a tab, opening one from the sidebar, a hotkey
+    /// jump, Option+H/L, Ctrl+Tab), not just one dedicated "navigate"
+    /// entry point. Ctrl+O/Ctrl+I (`jump_tab_history`) move `tab_jump_cursor`
+    /// and set `active_tab` to match the entry already at that position,
+    /// so they never re-record themselves as a new jump.
+    tab_jump_history: Vec<Uuid>,
+    /// Index into `tab_jump_history` for "where we currently are" — distinct
+    /// from `active_tab` itself, since after Ctrl+O moves back, the entries
+    /// *ahead* of this cursor are kept (not discarded) until the user
+    /// navigates somewhere new by any other means, matching how a browser's
+    /// back/forward history works.
+    tab_jump_cursor: usize,
 }
 
 impl App {
@@ -633,6 +669,11 @@ impl App {
             fuzzy_matcher: nucleo_matcher::Matcher::default(),
             last_screen_size: None,
             resize_settle_deadline: None,
+            sidebar_visible: true,
+            sidebar_auto_hidden: false,
+            sidebar_was_narrow: false,
+            tab_jump_history: Vec::new(),
+            tab_jump_cursor: 0,
         }
     }
 
@@ -1513,6 +1554,24 @@ impl App {
             ui.horizontal(|ui| {
                 ui.heading("RustGirl");
                 ui.separator();
+                let sidebar_label = if self.sidebar_visible {
+                    "Hide Sidebar"
+                } else {
+                    "Show Sidebar"
+                };
+                if ui
+                    .button(sidebar_label)
+                    .on_hover_text("Toggle the left sidebar (also auto-hides on a narrow window)")
+                    .clicked()
+                {
+                    self.sidebar_visible = !self.sidebar_visible;
+                    // A manual toggle always wins over the auto-hide memory
+                    // — otherwise re-opening it while still narrow would
+                    // just get auto-hidden again next time the width check
+                    // runs (see `sidebar_auto_hidden`'s own doc comment).
+                    self.sidebar_auto_hidden = false;
+                }
+                ui.separator();
                 ui.label("Environment:");
                 let current_name = self
                     .active_env()
@@ -2145,6 +2204,55 @@ impl App {
                 return;
             }
         }
+    }
+
+    /// Vim-jumplist-style back (`delta = -1`, Ctrl+O) / forward (`delta =
+    /// 1`, Ctrl+I) navigation across previously active tabs. Walks
+    /// `tab_jump_cursor` in the given direction, skipping any entry whose
+    /// tab has since been closed (rather than getting stuck on a stale id),
+    /// and stops silently once it runs off either end of the history —
+    /// there's nothing further to jump to, not an error.
+    fn jump_tab_history(&mut self, delta: isize) {
+        let mut cursor = self.tab_jump_cursor as isize;
+        loop {
+            cursor += delta;
+            if cursor < 0 || cursor as usize >= self.tab_jump_history.len() {
+                return;
+            }
+            let candidate_id = self.tab_jump_history[cursor as usize];
+            if let Some(idx) = self
+                .tabs
+                .iter()
+                .position(|t| t.current_request.id == candidate_id)
+            {
+                self.tab_jump_cursor = cursor as usize;
+                self.active_tab = idx;
+                return;
+            }
+            // That tab was closed since it was recorded — keep walking the
+            // same direction instead of stopping on a dead entry.
+        }
+    }
+
+    /// Records the currently active tab into `tab_jump_history` if it isn't
+    /// already what's recorded at `tab_jump_cursor` — called once, at the
+    /// end of every frame, so it captures *every* way the active tab can
+    /// change (clicking a tab, opening one from the sidebar, a hotkey jump,
+    /// Option+H/L, Ctrl+Tab) without needing each of those call sites to
+    /// remember to record it themselves. `jump_tab_history` itself never
+    /// triggers a new recording here: it sets `active_tab` to match the
+    /// entry already sitting at the new `tab_jump_cursor`, so the comparison
+    /// below finds them equal and does nothing.
+    fn record_tab_jump_if_changed(&mut self) {
+        let Some(current_id) = self.tabs.get(self.active_tab).map(|t| t.current_request.id) else {
+            return;
+        };
+        if self.tab_jump_history.get(self.tab_jump_cursor) == Some(&current_id) {
+            return;
+        }
+        self.tab_jump_history.truncate(self.tab_jump_cursor + 1);
+        self.tab_jump_history.push(current_id);
+        self.tab_jump_cursor = self.tab_jump_history.len() - 1;
     }
 
     fn environments_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -4685,6 +4793,12 @@ fn script_editor(ui: &mut egui::Ui, id_salt: &str, script: &mut String) {
 /// whole row for navigation and just hasn't decided what `j`/`k` do yet).
 const HOTKEY_CHARS: &str = "0123456789abcdefgimnopqrstuvwxyz";
 
+/// Window width below which the sidebar auto-hides itself (see
+/// `sidebar_auto_hidden`) — a UX heuristic tuned to roughly "the sidebar's
+/// own width plus enough of the request editor to still be usable," not a
+/// value derived from anything more precise.
+const SIDEBAR_AUTO_HIDE_WIDTH: f32 = 640.0;
+
 /// Maps a hotkey character to the `egui::Key` that must be pressed for it —
 /// `None` for anything outside `HOTKEY_CHARS`.
 fn key_for_char(c: char) -> Option<egui::Key> {
@@ -5720,15 +5834,48 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::L)) {
             self.active_tab = (self.active_tab + 1) % self.tabs.len();
         }
+        // Vim's own jumplist convention (Ctrl+O back, Ctrl+I forward) —
+        // here, across previously active *tabs* rather than cursor
+        // positions. See `jump_tab_history` for the walk/skip-stale logic
+        // and `record_tab_jump_if_changed` (called at the very end of this
+        // function) for how entries get added in the first place.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
+            self.jump_tab_history(-1);
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I)) {
+            self.jump_tab_history(1);
+        }
         // Matches the existing "Save" button/`save_current_request`, same
         // convention as every other editor's save shortcut.
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save_current_request();
         }
+        // Auto-hide/auto-restore the sidebar on window width, edge-triggered
+        // off the narrow/wide transition (not "every frame while narrow")
+        // so a manual re-open while still narrow isn't immediately fought —
+        // see `sidebar_auto_hidden`'s own doc comment. `screen_size` above
+        // is already computed once per frame for the resize-settle check,
+        // reused here rather than measuring the window a second time.
+        let narrow = screen_size.x < SIDEBAR_AUTO_HIDE_WIDTH;
+        if narrow && !self.sidebar_was_narrow && self.sidebar_visible {
+            self.sidebar_visible = false;
+            self.sidebar_auto_hidden = true;
+        } else if !narrow && self.sidebar_was_narrow && self.sidebar_auto_hidden {
+            self.sidebar_visible = true;
+            self.sidebar_auto_hidden = false;
+        }
+        self.sidebar_was_narrow = narrow;
         self.top_bar(ui);
-        self.sidebar(ui);
+        if self.sidebar_visible {
+            self.sidebar(ui);
+        }
         self.central(ui);
         self.command_palette(ui.ctx());
+        // Captures every way `active_tab` could have just changed this
+        // frame (tab-bar click, sidebar click, hotkey jump, Option+H/L,
+        // Ctrl+Tab, ...) into the jumplist in one place, rather than each
+        // of those call sites needing to remember to record it themselves.
+        self.record_tab_jump_if_changed();
         if self.tabs.iter().any(OpenTab::is_dirty) {
             // Edits are pending but still within the throttle window: keep
             // repainting so the debounce timer actually elapses instead of
@@ -6305,6 +6452,112 @@ mod tests {
         );
     }
 
+    /// Pure test for `jump_tab_history`'s walk/skip-stale logic, no `egui::Ui`
+    /// involved: 3 tabs, a jump history visiting all 3 in order, cursor at
+    /// the end — Ctrl+O should step back one at a time, Ctrl+I should step
+    /// forward, and both should refuse to walk off either end of the list.
+    #[test]
+    fn jump_tab_history_steps_back_and_forth_and_stops_at_the_ends() {
+        let mut app = App::with_data(AppData::default());
+        app.new_blank_tab();
+        app.new_blank_tab();
+        assert_eq!(app.tabs.len(), 3);
+        let ids: Vec<Uuid> = app.tabs.iter().map(|t| t.current_request.id).collect();
+        app.tab_jump_history = ids.clone();
+        app.tab_jump_cursor = 2;
+        app.active_tab = 2;
+
+        app.jump_tab_history(-1);
+        assert_eq!(app.tab_jump_cursor, 1);
+        assert_eq!(app.active_tab, 1);
+
+        app.jump_tab_history(-1);
+        assert_eq!(app.tab_jump_cursor, 0);
+        assert_eq!(app.active_tab, 0);
+
+        app.jump_tab_history(-1); // nothing further back — no-op
+        assert_eq!(app.tab_jump_cursor, 0);
+        assert_eq!(app.active_tab, 0);
+
+        app.jump_tab_history(1);
+        assert_eq!(app.tab_jump_cursor, 1);
+        assert_eq!(app.active_tab, 1);
+
+        app.jump_tab_history(1);
+        app.jump_tab_history(1); // nothing further forward — no-op
+        assert_eq!(app.tab_jump_cursor, 2);
+        assert_eq!(app.active_tab, 2);
+    }
+
+    /// A jump-history entry whose tab has since been closed is skipped over
+    /// rather than getting the cursor stuck on a dead id — the middle tab
+    /// closes, then Ctrl+O from the last entry should land on the first
+    /// entry, not on the now-nonexistent middle one.
+    #[test]
+    fn jump_tab_history_skips_over_an_entry_whose_tab_was_closed() {
+        let mut app = App::with_data(AppData::default());
+        app.new_blank_tab();
+        app.new_blank_tab();
+        let ids: Vec<Uuid> = app.tabs.iter().map(|t| t.current_request.id).collect();
+        app.tab_jump_history = ids.clone();
+        app.tab_jump_cursor = 2;
+        app.active_tab = 2;
+
+        app.close_tab(1); // closes the middle tab (index 1, id ids[1])
+
+        app.jump_tab_history(-1);
+        assert_eq!(
+            app.active_tab,
+            app.tabs
+                .iter()
+                .position(|t| t.current_request.id == ids[0])
+                .unwrap(),
+            "the stale middle entry should be skipped, landing on the first tab"
+        );
+    }
+
+    /// `record_tab_jump_if_changed`'s own predicate, independent of `fn
+    /// ui`'s call site: recording is a no-op when the active tab already
+    /// matches what's at the cursor (the "Ctrl+O/I just moved here"
+    /// case), and truncates any forward history before appending when it
+    /// doesn't (matching a browser's back/forward history semantics).
+    #[test]
+    fn record_tab_jump_if_changed_is_a_no_op_when_already_recorded_but_truncates_and_appends_otherwise()
+     {
+        let mut app = App::with_data(AppData::default());
+        app.new_blank_tab();
+        let id0 = app.tabs[0].current_request.id;
+        let id1 = app.tabs[1].current_request.id;
+
+        // First-ever call: self-initializes from empty history.
+        app.active_tab = 0;
+        app.record_tab_jump_if_changed();
+        assert_eq!(app.tab_jump_history, vec![id0]);
+        assert_eq!(app.tab_jump_cursor, 0);
+
+        // Already recorded at the cursor: no-op.
+        app.record_tab_jump_if_changed();
+        assert_eq!(app.tab_jump_history, vec![id0]);
+
+        // A genuinely new active tab: appended, cursor advances.
+        app.active_tab = 1;
+        app.record_tab_jump_if_changed();
+        assert_eq!(app.tab_jump_history, vec![id0, id1]);
+        assert_eq!(app.tab_jump_cursor, 1);
+
+        // Simulate having gone back via Ctrl+O, then navigating somewhere
+        // new by ordinary means — the discarded "forward" entry (id1)
+        // should not survive.
+        app.tab_jump_cursor = 0;
+        app.active_tab = 0;
+        app.new_blank_tab();
+        let id2 = app.tabs[2].current_request.id;
+        app.active_tab = 2;
+        app.record_tab_jump_if_changed();
+        assert_eq!(app.tab_jump_history, vec![id0, id2]);
+        assert_eq!(app.tab_jump_cursor, 1);
+    }
+
     /// Anyone who already relied on the old Alt+1..9-opens-"Saved Requests"
     /// shortcut should see the exact same requests still bound to the same
     /// keys once this feature replaces it — `App::with_data` (via
@@ -6682,6 +6935,107 @@ mod tests {
             1,
             "Option+H moves to the previous tab"
         );
+    }
+
+    /// Ctrl+O/Ctrl+I (Vim's own jumplist convention) walk back and forth
+    /// across tabs actually visited, driven by real injected key events and
+    /// real tab-bar clicks — not just calling `jump_tab_history` directly —
+    /// so this also exercises `record_tab_jump_if_changed`'s end-of-frame
+    /// wiring in `fn ui`.
+    #[test]
+    #[ignore]
+    fn ctrl_o_and_ctrl_i_step_through_the_tab_visit_history() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Req A"));
+        collection.requests.push(RequestItem::new("Req B"));
+        collection.requests.push(RequestItem::new("Req C"));
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step(); // records the initial blank tab as the first jump entry
+
+        // Collections start collapsed by default — expand "Demo" first (see
+        // `clicking_a_background_tab_switches_to_it`'s comment for why this
+        // needs two steps, not one).
+        harness.get_by_label("Demo").click();
+        harness.step();
+        harness.step();
+
+        // Open each request in turn, via real sidebar clicks (not by poking
+        // `active_tab` directly) — each resulting `active_tab` change gets
+        // picked up by `record_tab_jump_if_changed` next frame.
+        harness.get_by_label("Req A").click();
+        harness.step();
+        assert_eq!(harness.state().active_tab, 1);
+        harness.get_by_label("Req B").click();
+        harness.step();
+        assert_eq!(harness.state().active_tab, 2);
+        harness.get_by_label("Req C").click();
+        harness.step();
+        assert_eq!(harness.state().active_tab, 3);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::O);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            2,
+            "Ctrl+O steps back to Req B's tab"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::O);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            1,
+            "Ctrl+O steps back to Req A's tab"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::I);
+        harness.step();
+        assert_eq!(
+            harness.state().active_tab,
+            2,
+            "Ctrl+I steps forward again to Req B's tab"
+        );
+    }
+
+    /// The sidebar auto-hides once the window narrows past
+    /// `SIDEBAR_AUTO_HIDE_WIDTH`, and auto-restores once it's widened back
+    /// out — driven by real `Harness::set_size` calls, not by poking
+    /// `sidebar_visible` directly, so this exercises the actual width check
+    /// in `fn ui`.
+    #[test]
+    #[ignore]
+    fn sidebar_auto_hides_on_narrow_width_and_restores_when_widened_back() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(AppData::default()));
+        harness.step();
+        assert!(
+            harness.state().sidebar_visible,
+            "starts visible at a normal width"
+        );
+
+        harness.set_size(egui::vec2(500.0, 750.0));
+        harness.step();
+        assert!(
+            !harness.state().sidebar_visible,
+            "auto-hides once the window narrows past the threshold"
+        );
+        assert!(harness.state().sidebar_auto_hidden);
+
+        harness.set_size(egui::vec2(1100.0, 750.0));
+        harness.step();
+        assert!(
+            harness.state().sidebar_visible,
+            "auto-restores once the window is widened back out"
+        );
+        assert!(!harness.state().sidebar_auto_hidden);
     }
 
     #[test]

@@ -270,3 +270,23 @@ AeroSpace, command palette leader-key, tab Console ✅
 - **125 unit test** (từ 108) — thêm test cho việc làm phẳng cây theo từng
   mức mở, round-trip phím tắt, migration Alt+1..9 cũ, ghi console log, và
   xếp hạng fuzzy match.
+
+## Phase 16 — Nút tắt/mở sidebar, jumplist tab kiểu Vim ✅
+- **Nút "Hide Sidebar"/"Show Sidebar"** ở top bar — bấm để ẩn/hiện sidebar
+  bên trái bất cứ lúc nào.
+- **Tự động ẩn sidebar khi cửa sổ hẹp lại** (dưới ~640px), và **tự động
+  hiện lại** khi mở rộng cửa sổ ra — nếu tự tay bấm mở lại sidebar lúc đang
+  hẹp thì nó không bị tự đóng lại nữa (chỉ tự động can thiệp lúc chuyển từ
+  rộng sang hẹp hoặc ngược lại, không phải mỗi frame).
+- **Ctrl+I / Ctrl+O** để nhảy tới lui giữa lịch sử các tab đã từng mở, giống
+  jumplist của Vim — không chỉ là cycle tuần tự như Ctrl+Tab, mà đi theo
+  đúng thứ tự các tab thực sự đã ghé qua, kể cả khi quay lại rồi mở tab mới
+  (lịch sử "đi tiếp" phía trước bị xóa, giống nút back/forward trình
+  duyệt). Nếu 1 tab trong lịch sử đã bị đóng thì tự động bỏ qua, không bị
+  kẹt.
+- **Dialog import chọn nhiều file cùng lúc** (Postman collection, OpenAPI,
+  Postman environment) — import hàng loạt trong 1 lần, mỗi file báo kết
+  quả riêng trong 1 dòng thông báo chung.
+- **128 unit test** (từ 125) — thêm test cho logic jumplist (đi tới/lui,
+  dừng ở 2 đầu, bỏ qua tab đã đóng) và test tự động ẩn/hiện sidebar theo độ
+  rộng cửa sổ.
