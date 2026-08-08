@@ -5029,6 +5029,25 @@ fn insert_all_folder_ids(folders: &[Folder], expanded: &mut std::collections::Ha
     }
 }
 
+/// A small clickable expand/collapse toggle rendered as a real triangle
+/// icon — drawn with `Painter` shapes via egui's own
+/// `collapsing_header::paint_default_icon` (the exact routine
+/// `CollapsingHeader` uses internally for its own disclosure arrow), not a
+/// font glyph. The earlier plain `"v"`/`">"` text was a deliberate
+/// workaround for this bundled font's missing Unicode triangle glyphs
+/// (`▶`/`▼`, tofu boxes confirmed in Phases 2/3/8/9/15) — painting the
+/// triangle as vector shapes sidesteps the font question entirely, so this
+/// finally gets a real icon instead of another glyph gamble.
+fn expand_toggle_icon(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
+    let size = ui.spacing().icon_width.max(14.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let openness = if is_open { 1.0 } else { 0.0 };
+        egui::containers::collapsing_header::paint_default_icon(ui, openness, &response);
+    }
+    response
+}
+
 /// Draws one row of the flattened, virtualized collection tree — the
 /// replacement for the old recursive `folder_contents` (which held live
 /// `&mut Folder`/`&mut RequestItem` references and drew a nested
@@ -5126,13 +5145,9 @@ fn render_collection_row(
             }
         } else {
             let is_open = expanded.contains(&collection_id);
-            // Plain ASCII, not a Unicode triangle glyph: "▶"/"▼" (U+25B6/
-            // U+25BC) sit in the same Geometric Shapes block as "●"
-            // (U+25CF), which Phases 2/3/8/9's snapshots already caught as
-            // unrendered tofu boxes in this exact bundled font — a
-            // recurring, well-documented lesson in this codebase, not
-            // worth rediscovering per icon.
-            let toggle_clicked = ui.small_button(if is_open { "v" } else { ">" }).clicked();
+            // See `expand_toggle_icon`'s own doc comment for why this is a
+            // painted triangle, not a font glyph.
+            let toggle_clicked = expand_toggle_icon(ui, is_open).clicked();
             // The name itself is *also* clickable and toggles the same
             // state — `CollapsingHeader` (what this replaced) let you click
             // anywhere on the header row, not just a dedicated arrow, and
@@ -5152,6 +5167,22 @@ fn render_collection_row(
                     expanded.insert(collection_id);
                 }
             }
+            // A visible quick-add, not just the context-menu entry below —
+            // "+ Request"/"+ Folder" used to live in the `CollapsingHeader`
+            // body (only reachable when expanded) and moved into the
+            // context menu during the tree-virtualization rewrite (Phase
+            // 15), which made it a real discoverability regression: no
+            // visible affordance at all unless you already knew to
+            // right-click. Right-aligned via `Layout::right_to_left` so it
+            // sits at the row's edge regardless of the name's own width.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+").on_hover_text("Add request").clicked() {
+                    actions.push(PendingAction::AddRequest {
+                        collection: collection_id,
+                        folder_path: Vec::new(),
+                    });
+                }
+            });
         }
     });
 
@@ -5282,7 +5313,7 @@ fn render_folder_row(
                 ui.weak("::");
             });
             let is_open = expanded.contains(&folder_id);
-            let toggle_clicked = ui.small_button(if is_open { "v" } else { ">" }).clicked();
+            let toggle_clicked = expand_toggle_icon(ui, is_open).clicked();
             // The name is also clickable and toggles the same state — see
             // the collection row's identical treatment for why.
             let name_clicked = ui
@@ -5295,6 +5326,16 @@ fn render_folder_row(
                     expanded.insert(folder_id);
                 }
             }
+            // See the collection row's identical addition for why this is
+            // back as a visible button, not just the context-menu entry.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+").on_hover_text("Add request").clicked() {
+                    actions.push(PendingAction::AddRequest {
+                        collection: collection_id,
+                        folder_path: child_path.clone(),
+                    });
+                }
+            });
         }
     });
 
