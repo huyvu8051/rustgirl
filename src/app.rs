@@ -635,11 +635,6 @@ pub struct App {
     /// bottom panels must be declared before the central panel that fills
     /// whatever space is left).
     console_open: bool,
-    /// Whether the console drawer shows its full scrollable history or just
-    /// a single compact line for the newest entry — starts collapsed so the
-    /// always-visible drawer stays out of the way by default; clicking the
-    /// compact line (or the newest entry's row once expanded) toggles it.
-    console_expanded: bool,
 }
 
 impl App {
@@ -726,12 +721,7 @@ impl App {
             sidebar_was_narrow: false,
             tab_jump_history: Vec::new(),
             tab_jump_cursor: 0,
-            // Always visible by default (matches real Postman's own Console,
-            // which sits along the bottom of the window all the time) —
-            // starts collapsed to a single compact line via
-            // `console_expanded: false` above, not fully hidden.
-            console_open: true,
-            console_expanded: false,
+            console_open: false,
         }
     }
 
@@ -4163,25 +4153,6 @@ impl App {
     /// Session-only (cleared here doesn't touch the durable `console.log`
     /// text file `push_console_entry` also writes to on every send).
     fn console_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.console_expanded {
-            // Collapsed (the default): nothing but a single neat line for
-            // the newest entry — no "Console" heading, no "×", no "Clear
-            // console", just the log line itself. Click it to expand.
-            if self.console.is_empty() {
-                ui.weak("Nothing sent yet this session.");
-                return;
-            }
-            let row = console_entry_row(ui, &self.console[0]);
-            if row
-                .interact(egui::Sense::click())
-                .on_hover_text("Click to expand")
-                .clicked()
-            {
-                self.console_expanded = true;
-            }
-            return;
-        }
-
         ui.horizontal(|ui| {
             ui.heading("Console");
             if ui.small_button("\u{d7}").on_hover_text("Close").clicked() {
@@ -4217,20 +4188,8 @@ impl App {
             // send should appear right at the top, not scrolled past.
             for (idx, entry) in self.console.iter().enumerate() {
                 let row = console_entry_row(ui, entry);
-                if idx == 0 {
-                    if should_scroll_to_newest {
-                        row.scroll_to_me(Some(egui::Align::TOP));
-                    }
-                    // Clicking the newest entry's row again toggles back to
-                    // the collapsed single-line view — the same row is the
-                    // toggle target whether collapsed or expanded.
-                    if row
-                        .interact(egui::Sense::click())
-                        .on_hover_text("Click to collapse")
-                        .clicked()
-                    {
-                        self.console_expanded = false;
-                    }
+                if idx == 0 && should_scroll_to_newest {
+                    row.scroll_to_me(Some(egui::Align::TOP));
                 }
                 for line in &entry.script_log {
                     ui.monospace(format!("  console.log: {line}"));
@@ -8096,7 +8055,6 @@ mod tests {
                 },
             ];
             state.console_open = true;
-            state.console_expanded = true;
         }
         harness.step();
         harness.snapshot("phase15_console_panel");
