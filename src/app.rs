@@ -211,6 +211,9 @@ enum LeaderAction {
     /// menu entry, for when the request is already open rather than
     /// visible in the sidebar tree.
     AssignHotkeyToActiveRequest,
+    /// Keyboard-only alternative to the top bar's "Hide/Show Sidebar"
+    /// button — same `toggle_sidebar` a manual click uses.
+    ToggleSidebar,
 }
 
 /// Leader-key sequences, checked only while nothing has keyboard focus
@@ -223,6 +226,7 @@ const LEADER_CHORDS: &[(&str, LeaderAction)] = &[
     (" sf", LeaderAction::OpenPalette),
     (" se", LeaderAction::SelectEnvironment),
     (" ah", LeaderAction::AssignHotkeyToActiveRequest),
+    (" us", LeaderAction::ToggleSidebar),
 ];
 
 /// A non-request action offered by the command palette
@@ -708,6 +712,16 @@ impl App {
 
     fn active_tab_mut(&mut self) -> &mut OpenTab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// Flips `sidebar_visible`, shared by the top bar's "Hide/Show Sidebar"
+    /// button and the `<leader>us` chord — a manual toggle always wins over
+    /// the auto-hide memory (`sidebar_auto_hidden`'s own doc comment),
+    /// otherwise re-opening it while the window is still narrow would just
+    /// get auto-hidden again the next time the width check runs.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_auto_hidden = false;
     }
 
     fn save(&self) {
@@ -1589,12 +1603,7 @@ impl App {
                     .on_hover_text("Toggle the left sidebar (also auto-hides on a narrow window)")
                     .clicked()
                 {
-                    self.sidebar_visible = !self.sidebar_visible;
-                    // A manual toggle always wins over the auto-hide memory
-                    // — otherwise re-opening it while still narrow would
-                    // just get auto-hidden again next time the width check
-                    // runs (see `sidebar_auto_hidden`'s own doc comment).
-                    self.sidebar_auto_hidden = false;
+                    self.toggle_sidebar();
                 }
                 ui.separator();
                 ui.label("Environment:");
@@ -6118,6 +6127,7 @@ impl eframe::App for App {
                                 self.pending_hotkey_assignment =
                                     Some(self.active_tab().current_request.id);
                             }
+                            LeaderAction::ToggleSidebar => self.toggle_sidebar(),
                         }
                         self.leader_buffer.clear();
                         self.leader_deadline = None;
@@ -8215,6 +8225,45 @@ mod tests {
             harness.state().pending_hotkey_assignment,
             Some(active_request_id),
             "space, a, h should start hotkey assignment for the active tab's request"
+        );
+    }
+
+    /// Space, u, s toggles the sidebar — a keyboard-only alternative to the
+    /// top bar's "Hide/Show Sidebar" button, sharing the same
+    /// `toggle_sidebar` (including clearing `sidebar_auto_hidden`, so it
+    /// behaves identically to a manual click either way).
+    #[test]
+    #[ignore]
+    fn leader_key_space_u_s_toggles_the_sidebar() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+        assert!(harness.state().sidebar_visible);
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::U);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+
+        assert!(
+            !harness.state().sidebar_visible,
+            "space, u, s should hide the sidebar"
+        );
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::U);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+
+        assert!(
+            harness.state().sidebar_visible,
+            "space, u, s again should show it again"
         );
     }
 

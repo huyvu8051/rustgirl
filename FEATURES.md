@@ -354,3 +354,6 @@ AeroSpace, command palette leader-key, tab Console ✅
   --ignored` vì cần GPU): click chuột phải thật để xác nhận menu context
   mở đúng, gõ phím leader-chord thật cho cả 2 tổ hợp mới, và snapshot cho
   banner gán phím tắt + badge phím tắt trên tab.
+- **`space` → `u` → `s`**: tắt/mở sidebar nhanh bằng bàn phím, tương đương
+  hệt nút "Hide/Show Sidebar" ở top bar (dùng chung 1 hàm nên hành vi giống
+  nhau 100%, kể cả việc không bị tự đóng lại khi cửa sổ đang hẹp).
