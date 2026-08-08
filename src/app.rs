@@ -487,6 +487,15 @@ pub struct App {
     /// Open request-editor tabs, Postman-style — never empty (see `close_tab`).
     tabs: Vec<OpenTab>,
     active_tab: usize,
+    /// Last `active_tab` the horizontal tab bar auto-scrolled to — lets
+    /// `tab_bar` scroll the active chip into view only on the frame it
+    /// actually changes, not every frame (which would fight a manual
+    /// horizontal scroll).
+    tab_bar_scrolled_to: usize,
+    /// `self.console.len()` last time `console_panel` auto-scrolled to the
+    /// newest entry — lets a fresh send jump the view to the top (where the
+    /// newest entry now lives) without fighting a manual scroll otherwise.
+    console_scrolled_len: usize,
 
     /// A display preference, not request data — stays global rather than
     /// per-tab (see the `OpenTab` doc comment).
@@ -685,6 +694,8 @@ impl App {
             active_environment,
             tabs: vec![OpenTab::new_unsaved()],
             active_tab: 0,
+            tab_bar_scrolled_to: 0,
+            console_scrolled_len: 0,
             auto_format_response: true,
             codegen_target: codegen::CodeGenTarget::Curl,
             new_collection_name: String::new(),
@@ -2842,7 +2853,7 @@ impl App {
                         if idx == self.active_tab {
                             chip_frame = chip_frame.stroke(egui::Stroke::new(1.5, theme::ACCENT));
                         }
-                        let (_, dropped) = ui.dnd_drop_zone::<usize, _>(chip_frame, |ui| {
+                        let (zone, dropped) = ui.dnd_drop_zone::<usize, _>(chip_frame, |ui| {
                             ui.horizontal(|ui| {
                                 // A dedicated drag handle, separate from the
                                 // selectable label/close button below: wrapping
@@ -2889,6 +2900,12 @@ impl App {
                         if let Some(dropped) = dropped {
                             reorder = Some((*dropped, idx));
                         }
+                        // Only scroll on the frame the active tab actually
+                        // changed (not every frame) — otherwise this would
+                        // fight a manual horizontal scroll through the bar.
+                        if idx == self.active_tab && self.active_tab != self.tab_bar_scrolled_to {
+                            zone.response.scroll_to_me(Some(egui::Align::Center));
+                        }
                     }
                     if ui
                         .button("+")
@@ -2924,6 +2941,7 @@ impl App {
                 self.active_tab
             };
         }
+        self.tab_bar_scrolled_to = self.active_tab;
     }
 
     fn request_editor(&mut self, ui: &mut egui::Ui) {
@@ -4145,12 +4163,17 @@ impl App {
             return;
         }
 
+        // Only jump the scroll position on the frame a new entry actually
+        // arrives (not every frame) — otherwise this would fight a manual
+        // scroll through older entries.
+        let should_scroll_to_newest = self.console.len() != self.console_scrolled_len;
+        self.console_scrolled_len = self.console.len();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // Oldest first — reads top-to-bottom like a real terminal log,
-            // unlike `self.console`'s own newest-first storage order (which
-            // matches `data.history`'s convention for "most recent at the
-            // top of a short list," not what a scrolling log should do).
-            for entry in self.console.iter().rev() {
+            // Newest first, matching `self.console`'s own storage order (and
+            // `data.history`'s "most recent at the top" convention) — a new
+            // send should appear right at the top, not scrolled past.
+            for (idx, entry) in self.console.iter().enumerate() {
                 let status_text = match (entry.status, &entry.error) {
                     (Some(status), _) => format!("{status}"),
                     (None, Some(err)) => format!("ERROR: {err}"),
@@ -4160,7 +4183,7 @@ impl App {
                     Some(s) => theme::status_color(s),
                     None => egui::Color32::RED,
                 };
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     ui.weak(entry.timestamp.format("%H:%M:%S").to_string());
                     ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
                     ui.label(&entry.url);
@@ -4169,6 +4192,9 @@ impl App {
                         ui.weak(format!("{ms}ms"));
                     }
                 });
+                if idx == 0 && should_scroll_to_newest {
+                    row.response.scroll_to_me(Some(egui::Align::TOP));
+                }
                 for line in &entry.script_log {
                     ui.monospace(format!("  console.log: {line}"));
                 }
