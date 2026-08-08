@@ -290,3 +290,38 @@ AeroSpace, command palette leader-key, tab Console ✅
 - **128 unit test** (từ 125) — thêm test cho logic jumplist (đi tới/lui,
   dừng ở 2 đầu, bỏ qua tab đã đóng) và test tự động ẩn/hiện sidebar theo độ
   rộng cửa sổ.
+
+## Phase 17 — Refactor giao diện giống Postman hết mức ✅
+- **Màu cam thương hiệu của Postman** áp dụng toàn app: màu chọn/hover/focus
+  và nút Send đổi sang cam, viền tab đang mở cũng viền cam — áp dụng đồng
+  thời cho cả theme Sáng/Tối/System qua 1 lần chỉnh style dùng chung.
+- **Bo góc mềm hơn** cho nút/ô nhập — giống độ bo góc thật của giao diện
+  Postman thay vì góc gần vuông mặc định của egui.
+- **Màu theo method (GET/POST/PUT/...)** giờ hiện khắp nơi thay vì chỉ ở
+  tab đang mở: trong cây collection, trong History, trong command palette,
+  và trong bảng kết quả Collection Runner.
+- **Màu status code tách rõ 4 mức** (2xx xanh lá, 3xx xanh dương, 4xx cam,
+  5xx đỏ) thay vì chỉ 3 mức cũ gộp chung 4xx/5xx làm một màu đỏ.
+- **Thứ tự tab request** đổi thành Params → Authorization → Headers →
+  Body → Pre-request Script → Tests → Code, giống đúng thứ tự thật của
+  Postman (trước đây Auth nằm sau Headers/Body). Tab "Auth" đổi tên thành
+  "Authorization" cho khớp nhãn thật của Postman.
+- **Đếm số dòng đang bật ngay trên tên tab**: "Params (2)", "Headers (3)"
+  — giống hệt kiểu Postman, cùng quy ước với "Tests (đã pass/tổng)" có sẵn.
+- **Thứ tự tab response** đổi thành Body → Cookies → Headers → Tests →
+  Request → Diff (2 tab cuối là phần mở rộng riêng của app, không có ở
+  Postman nên xếp sau cùng).
+- **Sidebar có màu nền hơi tối hơn** một chút so với vùng nội dung chính —
+  tạo cảm giác đây là 1 vùng "khung" riêng biệt giống Postman thật, thay vì
+  phẳng lì như trước.
+- **Console chuyển thành khay kéo ở đáy cửa sổ** giống Postman thật (trước
+  đây Console chiếm toàn bộ màn hình giữa, che mất request/response) — giờ
+  bấm nút "Console" chỉ mở/đóng 1 khay nhỏ ở dưới cùng, request/response
+  vẫn hiển thị bình thường phía trên, có nút "×" đóng riêng trong khay.
+- **Sửa lỗi tràn giao diện khi import nhiều file cùng lúc**: import ít file
+  thì vẫn báo chi tiết từng file như trước; import nhiều file thì gộp lại
+  thành 1 dòng ngắn gọn ("Imported 10 files successfully.") và chỉ liệt kê
+  chi tiết những file bị lỗi. Dòng thông báo giờ tự xuống dòng, giới hạn
+  chiều cao, và có nút "×" để tắt hẳn đi thay vì cứ nằm lì mãi.
+- **133 unit test** (từ 130) — thêm test cho các mức màu status/method, và
+  test cho logic gộp thông báo import hàng loạt.

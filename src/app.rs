@@ -58,7 +58,6 @@ enum CentralView {
         collection: Uuid,
         folder_path: Vec<Uuid>,
     },
-    Console,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -591,6 +590,17 @@ pub struct App {
     /// navigates somewhere new by any other means, matching how a browser's
     /// back/forward history works.
     tab_jump_cursor: usize,
+
+    /// Whether the Console drawer is showing along the bottom of the window
+    /// — a real Postman-fidelity fix: Console used to be a `CentralView`
+    /// that replaced the whole request/response area, but real Postman's
+    /// Console is a collapsible panel anchored to the *bottom* of the
+    /// window, sitting below the request/response area rather than hiding
+    /// it. Toggled by the top bar's "Console" button; rendered in `fn ui`
+    /// via `egui::Panel::bottom` *before* `self.central(ui)` is called (side/
+    /// bottom panels must be declared before the central panel that fills
+    /// whatever space is left).
+    console_open: bool,
 }
 
 impl App {
@@ -674,6 +684,7 @@ impl App {
             sidebar_was_narrow: false,
             tab_jump_history: Vec::new(),
             tab_jump_cursor: 0,
+            console_open: false,
         }
     }
 
@@ -739,7 +750,7 @@ impl App {
         if added_any {
             self.save();
         }
-        self.import_message = Some(results.join(" | "));
+        self.import_message = Some(describe_import_batch(results));
     }
 
     fn import_openapi_spec(&mut self) {
@@ -768,7 +779,7 @@ impl App {
         if added_any {
             self.save();
         }
-        self.import_message = Some(results.join(" | "));
+        self.import_message = Some(describe_import_batch(results));
     }
 
     /// Parses `self.curl_import_text` and, on success, loads it as an
@@ -821,7 +832,7 @@ impl App {
         if added_any {
             self.save();
         }
-        self.import_message = Some(results.join(" | "));
+        self.import_message = Some(describe_import_batch(results));
     }
 
     /// Adds a fresh copy of `Collection::sample()` — self-service, so a user
@@ -1621,8 +1632,15 @@ impl App {
                 } else {
                     format!("Console ({})", self.console.len())
                 };
-                if ui.button(console_label).clicked() {
-                    self.central_view = CentralView::Console;
+                // A toggle, not a view switch — Postman's own Console lives
+                // in a collapsible drawer along the bottom of the window,
+                // not a full-screen view that replaces the request/response
+                // area (see the bottom-panel render in `fn ui`).
+                if ui
+                    .selectable_label(self.console_open, console_label)
+                    .clicked()
+                {
+                    self.console_open = !self.console_open;
                 }
                 if ui.button("Settings").clicked() {
                     self.central_view = CentralView::Settings;
@@ -1639,9 +1657,17 @@ impl App {
 
     // ---------- UI: sidebar ----------
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        // A subtly darker fill than the main content panel — Postman's own
+        // sidebar reads as a visually distinct "chrome" surface, not a flat
+        // continuation of the request/response area (`theme::recessed_panel_fill`
+        // computes this relative to the resolved theme's own panel color, so
+        // it looks right in dark, light, and system-follow mode alike).
+        let fill = theme::recessed_panel_fill(ui.style().visuals.panel_fill);
+        let frame = egui::Frame::side_top_panel(ui.style()).fill(fill);
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(280.0)
+            .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(
@@ -1740,9 +1766,7 @@ impl App {
                 }
             });
         }
-        if let Some(msg) = self.import_message.clone() {
-            ui.weak(msg);
-        }
+        import_message_banner(ui, &mut self.import_message);
         ui.horizontal(|ui| {
             if ui
                 .small_button("Expand all")
@@ -2289,9 +2313,7 @@ impl App {
                 self.import_postman_environment();
             }
         });
-        if let Some(msg) = self.import_message.clone() {
-            ui.weak(msg);
-        }
+        import_message_banner(ui, &mut self.import_message);
         ui.separator();
 
         let mut delete_env: Option<Uuid> = None;
@@ -2362,16 +2384,13 @@ impl App {
                 .duration_ms
                 .map(|ms| format!(" {ms}ms"))
                 .unwrap_or_default();
-            let label = format!(
-                "{} {} [{}]{}",
-                entry.method.as_str(),
-                entry.url,
-                status,
-                duration
-            );
-            if ui.selectable_label(false, label).clicked() {
-                load = Some(i);
-            }
+            let label = format!("{} [{}]{}", entry.url, status, duration);
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
+                if ui.selectable_label(false, label).clicked() {
+                    load = Some(i);
+                }
+            });
         }
         // Restores both the request definition *and* the exact response
         // that was received at the time, so a history entry is a full
@@ -2593,21 +2612,41 @@ impl App {
                             ui.weak("No matching requests or commands.");
                         }
                         for (i, entry) in entries.iter().enumerate() {
-                            let label = match entry {
-                                PaletteEntry::Action { label, .. } => format!("> {label}"),
-                                PaletteEntry::Request { item, .. } => {
-                                    format!(
-                                        "{}   {}   —   {}",
-                                        item.method.as_str(),
-                                        item.name,
-                                        item.url
-                                    )
-                                }
+                            // A hand-rolled composite row rather than a plain
+                            // `selectable_label(i == self.palette_selected, label)`:
+                            // a request entry's method needs its own color
+                            // (`theme::method_color`), and a `colored_label`
+                            // sitting next to a `selectable_label` wouldn't
+                            // share its selection background — painting the
+                            // background on a wrapping `Frame` first, then
+                            // making that whole frame clickable via
+                            // `.interact(Sense::click())`, keeps the
+                            // Ctrl+N/P highlight covering the full row.
+                            let fill = if i == self.palette_selected {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                egui::Color32::TRANSPARENT
                             };
-                            if ui
-                                .selectable_label(i == self.palette_selected, label)
-                                .clicked()
-                            {
+                            let row = egui::Frame::new()
+                                .fill(fill)
+                                .inner_margin(egui::Margin::symmetric(4, 2))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| match entry {
+                                        PaletteEntry::Action { label, .. } => {
+                                            ui.label(format!("> {label}"));
+                                        }
+                                        PaletteEntry::Request { item, .. } => {
+                                            ui.colored_label(
+                                                theme::method_color(item.method),
+                                                item.method.as_str(),
+                                            );
+                                            ui.label(&item.name);
+                                            ui.weak("—");
+                                            ui.weak(&item.url);
+                                        }
+                                    });
+                                });
+                            if row.response.interact(egui::Sense::click()).clicked() {
                                 selected = Some(entry.clone());
                             }
                         }
@@ -2644,7 +2683,14 @@ impl App {
                 ui.separator();
                 match self.split_direction {
                     SplitDirection::Vertical => {
-                        let height = ui.available_height() * 0.55;
+                        // Rounded to a whole pixel: an unrounded fraction
+                        // here (more likely now that the Console drawer can
+                        // also be eating a slice of `available_height`)
+                        // trips egui's debug-only `show_unaligned` overlay
+                        // in `cargo test`/dev builds — harmless in a real
+                        // `--release` binary, but worth avoiding for a
+                        // clean snapshot baseline.
+                        let height = (ui.available_height() * 0.55).round();
                         egui::Panel::top("request_editor_panel_v")
                             .resizable(true)
                             .default_size(height)
@@ -2653,7 +2699,7 @@ impl App {
                         egui::CentralPanel::default().show(ui, |ui| self.response_viewer(ui));
                     }
                     SplitDirection::Horizontal => {
-                        let width = ui.available_width() * 0.5;
+                        let width = (ui.available_width() * 0.5).round();
                         egui::Panel::left("request_editor_panel_h")
                             .resizable(true)
                             .default_size(width)
@@ -2671,7 +2717,6 @@ impl App {
                 collection,
                 folder_path,
             } => self.folder_editor(ui, collection, &folder_path),
-            CentralView::Console => self.console_panel(ui),
         });
     }
 
@@ -2692,48 +2737,56 @@ impl App {
                 ui.horizontal(|ui| {
                     for (idx, tab) in self.tabs.iter().enumerate() {
                         let drag_id = egui::Id::new(("open_tab", idx));
-                        let (_, dropped) =
-                            ui.dnd_drop_zone::<usize, _>(egui::Frame::group(ui.style()), |ui| {
-                                ui.horizontal(|ui| {
-                                    // A dedicated drag handle, separate from the
-                                    // selectable label/close button below: wrapping
-                                    // the *whole* chip in `dnd_drag_source` (as this
-                                    // did originally) intercepts plain clicks — its
-                                    // own `Sense::drag()` interact sits on top of
-                                    // the label's `Sense::click()` and swallows the
-                                    // click before it reaches it, so a tab could
-                                    // never be selected. Same bug, same fix, as the
-                                    // collection-tree rows in Phase 3.
-                                    ui.dnd_drag_source(drag_id, idx, |ui| {
-                                        ui.weak("::");
-                                    });
-                                    let (color, method_text) =
-                                        method_badge_color(tab.current_request.method);
-                                    ui.colored_label(color, method_text);
-                                    let name = if tab.current_request.name.is_empty() {
-                                        "Untitled Request"
-                                    } else {
-                                        tab.current_request.name.as_str()
-                                    };
-                                    let selected =
-                                        ui.selectable_label(idx == self.active_tab, name).clicked();
-                                    if tab.is_dirty() {
-                                        // Plain ASCII "*" rather than "●"
-                                        // (U+25CF): egui's bundled font doesn't
-                                        // cover it, rendering as an empty tofu
-                                        // box — same class of missing-glyph
-                                        // issue hit (and fixed the same way) in
-                                        // Phases 2, 3, and 7.
-                                        ui.weak("*");
-                                    }
-                                    if ui.small_button("\u{d7}").clicked() {
-                                        close_idx = Some(idx);
-                                    }
-                                    if selected {
-                                        select_idx = Some(idx);
-                                    }
+                        // The active tab's chip gets an accent-colored border —
+                        // egui's `Frame` strokes the whole rectangle rather
+                        // than one edge, so this approximates Postman's own
+                        // colored active-tab underline as a full outline
+                        // instead of a broken attempt at a partial one.
+                        let mut chip_frame = egui::Frame::group(ui.style());
+                        if idx == self.active_tab {
+                            chip_frame = chip_frame.stroke(egui::Stroke::new(1.5, theme::ACCENT));
+                        }
+                        let (_, dropped) = ui.dnd_drop_zone::<usize, _>(chip_frame, |ui| {
+                            ui.horizontal(|ui| {
+                                // A dedicated drag handle, separate from the
+                                // selectable label/close button below: wrapping
+                                // the *whole* chip in `dnd_drag_source` (as this
+                                // did originally) intercepts plain clicks — its
+                                // own `Sense::drag()` interact sits on top of
+                                // the label's `Sense::click()` and swallows the
+                                // click before it reaches it, so a tab could
+                                // never be selected. Same bug, same fix, as the
+                                // collection-tree rows in Phase 3.
+                                ui.dnd_drag_source(drag_id, idx, |ui| {
+                                    ui.weak("::");
                                 });
+                                let method_text = tab.current_request.method.as_str();
+                                let color = theme::method_color(tab.current_request.method);
+                                ui.colored_label(color, method_text);
+                                let name = if tab.current_request.name.is_empty() {
+                                    "Untitled Request"
+                                } else {
+                                    tab.current_request.name.as_str()
+                                };
+                                let selected =
+                                    ui.selectable_label(idx == self.active_tab, name).clicked();
+                                if tab.is_dirty() {
+                                    // Plain ASCII "*" rather than "●"
+                                    // (U+25CF): egui's bundled font doesn't
+                                    // cover it, rendering as an empty tofu
+                                    // box — same class of missing-glyph
+                                    // issue hit (and fixed the same way) in
+                                    // Phases 2, 3, and 7.
+                                    ui.weak("*");
+                                }
+                                if ui.small_button("\u{d7}").clicked() {
+                                    close_idx = Some(idx);
+                                }
+                                if selected {
+                                    select_idx = Some(idx);
+                                }
                             });
+                        });
                         if let Some(dropped) = dropped {
                             reorder = Some((*dropped, idx));
                         }
@@ -2811,7 +2864,15 @@ impl App {
                     .hint_text("https://api.example.com/{{path}}")
                     .desired_width(ui.available_width() - 80.0),
             );
-            if ui.button("Send").on_hover_text("Option+Enter").clicked() {
+            // The one widget in the app with an explicit color override on
+            // top of the global accent styling (`theme::apply_postman_visuals`)
+            // — Postman's own Send button is the single most visually
+            // emphasized control in its whole UI, so this one gets a solid
+            // fill rather than just the accent-colored outline every other
+            // button gets.
+            let send = egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
+                .fill(theme::ACCENT);
+            if ui.add(send).on_hover_text("Option+Enter").clicked() {
                 send_clicked = true;
             }
         });
@@ -2845,10 +2906,39 @@ impl App {
 
         ui.separator();
         let tab = &mut self.tabs[self.active_tab];
+        // Live counts, same "(N)" convention the Tests tab already uses for
+        // "Tests (passed/total)" below — only enabled rows count, matching
+        // what actually gets sent.
+        let params_count = tab
+            .current_request
+            .params
+            .iter()
+            .filter(|kv| kv.enabled)
+            .count();
+        let params_label = if params_count > 0 {
+            format!("Params ({params_count})")
+        } else {
+            "Params".to_string()
+        };
+        let headers_count = tab
+            .current_request
+            .headers
+            .iter()
+            .filter(|kv| kv.enabled)
+            .count();
+        let headers_label = if headers_count > 0 {
+            format!("Headers ({headers_count})")
+        } else {
+            "Headers".to_string()
+        };
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut tab.request_tab, RequestTab::Params, "Params");
-            ui.selectable_value(&mut tab.request_tab, RequestTab::Headers, "Headers");
-            ui.selectable_value(&mut tab.request_tab, RequestTab::Auth, "Auth");
+            // Order matches Postman's own request-tab strip: Params,
+            // Authorization, Headers, Body, then scripts — Auth used to sit
+            // after Headers/Body, which didn't match. "Code" has no Postman
+            // equivalent, so it stays appended at the end.
+            ui.selectable_value(&mut tab.request_tab, RequestTab::Params, params_label);
+            ui.selectable_value(&mut tab.request_tab, RequestTab::Auth, "Authorization");
+            ui.selectable_value(&mut tab.request_tab, RequestTab::Headers, headers_label);
             ui.selectable_value(&mut tab.request_tab, RequestTab::Body, "Body");
             ui.selectable_value(
                 &mut tab.request_tab,
@@ -3344,13 +3434,7 @@ impl App {
         let mut has_response_without_bytes = false;
         if let Some(resp) = Self::effective_response(tab) {
             ui.horizontal(|ui| {
-                let color = if resp.status < 300 {
-                    egui::Color32::GREEN
-                } else if resp.status < 400 {
-                    egui::Color32::YELLOW
-                } else {
-                    egui::Color32::RED
-                };
+                let color = theme::status_color(resp.status);
                 ui.colored_label(
                     color,
                     format!("Status: {} {}", resp.status, resp.status_text),
@@ -3406,9 +3490,13 @@ impl App {
 
         let tab = &mut self.tabs[self.active_tab];
         ui.horizontal(|ui| {
+            // Order matches Postman's own response-tab strip for the tabs
+            // that have a real equivalent there (Body, Cookies, Headers,
+            // Tests) — "Request" and "Diff" are this app's own additions
+            // with no Postman counterpart, so they stay appended at the end.
             ui.selectable_value(&mut tab.response_tab, ResponseTab::Body, "Body");
+            ui.selectable_value(&mut tab.response_tab, ResponseTab::Cookies, "Cookies");
             ui.selectable_value(&mut tab.response_tab, ResponseTab::Headers, "Headers");
-            ui.selectable_value(&mut tab.response_tab, ResponseTab::Request, "Request");
             let passed = tab.test_results.iter().filter(|t| t.passed).count();
             let total = tab.test_results.len();
             let tests_label = if total > 0 {
@@ -3417,7 +3505,7 @@ impl App {
                 "Tests".to_string()
             };
             ui.selectable_value(&mut tab.response_tab, ResponseTab::TestResults, tests_label);
-            ui.selectable_value(&mut tab.response_tab, ResponseTab::Cookies, "Cookies");
+            ui.selectable_value(&mut tab.response_tab, ResponseTab::Request, "Request");
             ui.selectable_value(&mut tab.response_tab, ResponseTab::Diff, "Diff");
             if tab.response_tab == ResponseTab::Body {
                 ui.add_space(12.0);
@@ -3919,7 +4007,12 @@ impl App {
     /// Session-only (cleared here doesn't touch the durable `console.log`
     /// text file `push_console_entry` also writes to on every send).
     fn console_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Console");
+        ui.horizontal(|ui| {
+            ui.heading("Console");
+            if ui.small_button("\u{d7}").on_hover_text("Close").clicked() {
+                self.console_open = false;
+            }
+        });
         ui.horizontal(|ui| {
             if ui.button("Clear console").clicked() {
                 self.console.clear();
@@ -3948,13 +4041,12 @@ impl App {
                     (None, None) => "(no response)".to_string(),
                 };
                 let color = match entry.status {
-                    Some(s) if s < 300 => egui::Color32::GREEN,
-                    Some(s) if s < 400 => egui::Color32::YELLOW,
-                    _ => egui::Color32::RED,
+                    Some(s) => theme::status_color(s),
+                    None => egui::Color32::RED,
                 };
                 ui.horizontal(|ui| {
                     ui.weak(entry.timestamp.format("%H:%M:%S").to_string());
-                    ui.label(entry.method.as_str());
+                    ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
                     ui.label(&entry.url);
                     ui.colored_label(color, status_text);
                     if let Some(ms) = entry.duration_ms {
@@ -4079,17 +4171,16 @@ impl App {
                             ui.end_row();
                             for result in &self.runner.results {
                                 ui.label(format!("{}", result.iteration + 1));
-                                ui.label(result.method.as_str());
+                                ui.colored_label(
+                                    theme::method_color(result.method),
+                                    result.method.as_str(),
+                                );
                                 ui.label(&result.name);
                                 if let Some(status) = result.status {
-                                    let color = if status < 300 {
-                                        egui::Color32::GREEN
-                                    } else if status < 400 {
-                                        egui::Color32::YELLOW
-                                    } else {
-                                        egui::Color32::RED
-                                    };
-                                    ui.colored_label(color, status.to_string());
+                                    ui.colored_label(
+                                        theme::status_color(status),
+                                        status.to_string(),
+                                    );
                                 } else {
                                     ui.colored_label(
                                         egui::Color32::RED,
@@ -4290,9 +4381,7 @@ impl App {
                 self.central_view = CentralView::Request;
             }
         });
-        if let Some(msg) = self.import_message.clone() {
-            ui.weak(msg);
-        }
+        import_message_banner(ui, &mut self.import_message);
     }
 }
 
@@ -4360,19 +4449,85 @@ fn egui_theme_preference(mode: ThemeMode) -> egui::ThemePreference {
     }
 }
 
-/// Per-method color + short label for the tab bar's method badge, matching
-/// Postman's own per-method palette (green GET, orange/amber POST, blue PUT,
-/// purple/teal PATCH, red DELETE) — the one deliberately Postman-styled
-/// piece of UI this phase adds.
-fn method_badge_color(method: Method) -> (egui::Color32, &'static str) {
-    match method {
-        Method::Get => (egui::Color32::from_rgb(0x6b, 0xcb, 0x5f), "GET"),
-        Method::Post => (egui::Color32::from_rgb(0xf0, 0xad, 0x4e), "POST"),
-        Method::Put => (egui::Color32::from_rgb(0x5b, 0x9b, 0xd5), "PUT"),
-        Method::Patch => (egui::Color32::from_rgb(0x9b, 0x59, 0xb6), "PATCH"),
-        Method::Delete => (egui::Color32::from_rgb(0xe0, 0x5d, 0x5d), "DELETE"),
-        Method::Head => (egui::Color32::from_rgb(0x95, 0xa5, 0xa6), "HEAD"),
-        Method::Options => (egui::Color32::from_rgb(0x95, 0xa5, 0xa6), "OPTIONS"),
+/// Postman-inspired visual identity: a shared brand accent color, shared
+/// method/status color helpers (previously ad-hoc — a colored method badge
+/// only existed in the tab bar, and status coloring was a bare
+/// `Color32::GREEN/YELLOW/RED` literal repeated at 8+ separate call sites),
+/// and the one place that nudges egui's global `Style` itself toward
+/// Postman's own look.
+mod theme {
+    use super::Method;
+    use egui::Color32;
+
+    /// Postman's own real, public brand color.
+    pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0x6C, 0x37);
+
+    /// Per-method color, matching Postman's own per-method palette (green
+    /// GET, orange/amber POST, blue PUT, purple PATCH, red DELETE) — used
+    /// everywhere a method is displayed (tab bar, sidebar tree, history,
+    /// command palette, collection runner), not just the tab bar as before
+    /// this phase.
+    pub fn method_color(method: Method) -> Color32 {
+        match method {
+            Method::Get => Color32::from_rgb(0x6b, 0xcb, 0x5f),
+            Method::Post => Color32::from_rgb(0xf0, 0xad, 0x4e),
+            Method::Put => Color32::from_rgb(0x5b, 0x9b, 0xd5),
+            Method::Patch => Color32::from_rgb(0x9b, 0x59, 0xb6),
+            Method::Delete => Color32::from_rgb(0xe0, 0x5d, 0x5d),
+            Method::Head | Method::Options => Color32::from_rgb(0x95, 0xa5, 0xa6),
+        }
+    }
+
+    /// A 4-way refinement of the old `< 300`/`< 400`/else 3-way bucket that
+    /// used to be repeated as a bare `Color32::GREEN/YELLOW/RED` literal at
+    /// every status-display call site — this distinguishes a 4xx client
+    /// error from a 5xx server error (a common REST-client convention, not
+    /// a claim of pixel-exact Postman hex values, which a static code/crate
+    /// audit has no way to verify).
+    pub fn status_color(status: u16) -> Color32 {
+        match status {
+            0..=299 => Color32::from_rgb(0x6b, 0xcb, 0x5f), // 2xx: green
+            300..=399 => Color32::from_rgb(0x5b, 0x9b, 0xd5), // 3xx: blue
+            400..=499 => Color32::from_rgb(0xf0, 0xad, 0x4e), // 4xx: orange
+            _ => Color32::from_rgb(0xe0, 0x5d, 0x5d),       // 5xx+: red
+        }
+    }
+
+    /// A background fill for a panel meant to read as a visually distinct
+    /// "chrome" surface next to the main content area — Postman's own
+    /// sidebar reads this way. Nudges the theme's own panel color a few
+    /// shades darker via plain integer subtraction (`saturating_sub` clamps
+    /// at black), which reads as a subtle recess in both dark and light
+    /// mode without needing a separate hardcoded color per theme.
+    pub fn recessed_panel_fill(base: Color32) -> Color32 {
+        let shade = |c: u8| c.saturating_sub(10);
+        Color32::from_rgb(shade(base.r()), shade(base.g()), shade(base.b()))
+    }
+
+    /// Nudges egui's global `Style` — both the dark and light variant at
+    /// once, via `all_styles_mut` (confirmed present in the cached
+    /// egui-0.35.0 source: it mutates `dark_style`/`light_style` in one
+    /// call) — toward Postman's own look: the brand accent color on
+    /// selection/hyperlinks/focus-and-hover outlines, and slightly rounder
+    /// corners than egui's square-ish stock default. Called once per frame,
+    /// right alongside the existing `ctx.set_theme(...)` call — cheap (no
+    /// allocation beyond what `set_theme` itself already does every frame,
+    /// since this runs before any widget in the current frame could be
+    /// holding a live `Style` `Arc` clone) and idempotent, so no new
+    /// one-shot "already styled" field is needed.
+    pub fn apply_postman_visuals(ctx: &egui::Context) {
+        ctx.all_styles_mut(|style| {
+            style.visuals.selection.bg_fill = ACCENT;
+            style.visuals.hyperlink_color = ACCENT;
+            style.visuals.widgets.hovered.bg_stroke.color = ACCENT;
+            style.visuals.widgets.active.bg_stroke.color = ACCENT;
+            let radius = egui::CornerRadius::same(5);
+            style.visuals.widgets.inactive.corner_radius = radius;
+            style.visuals.widgets.hovered.corner_radius = radius;
+            style.visuals.widgets.active.corner_radius = radius;
+            style.visuals.widgets.open.corner_radius = radius;
+            style.visuals.window_corner_radius = radius;
+        });
     }
 }
 
@@ -5278,7 +5433,7 @@ fn render_request_row(
             }
         } else {
             if let Some(method) = method {
-                ui.label(method.as_str());
+                ui.colored_label(theme::method_color(method), method.as_str());
             }
             if let Some(key) = hotkey {
                 ui.weak(format!("[{key}]"));
@@ -5419,6 +5574,67 @@ fn describe_import_result(what: &str, warnings: &[String]) -> String {
             warnings.join("; ")
         )
     }
+}
+
+/// Summarizes a batch of per-file import results (Postman/OpenAPI/environment
+/// multi-file import) into one status message. Real bug report: joining
+/// every file's own result with `" | "` (the original multi-file-import
+/// behavior) reads fine for 2-3 files but produces a message long enough to
+/// overflow the sidebar once someone imports many collections at once — so
+/// a small batch still gets the old per-file detail (useful: it names each
+/// imported collection), but a larger one collapses to a single count,
+/// spelling out only the files that actually failed rather than every
+/// success too.
+fn describe_import_batch(results: Vec<String>) -> String {
+    const SMALL_BATCH: usize = 3;
+    let total = results.len();
+    if total <= SMALL_BATCH {
+        return results.join(" | ");
+    }
+    let failed: Vec<&String> = results
+        .iter()
+        .filter(|r| r.contains("failed") || r.contains("Could not read"))
+        .collect();
+    if failed.is_empty() {
+        format!("Imported {total} files successfully.")
+    } else {
+        let ok = total - failed.len();
+        let details = failed
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Imported {ok}/{total} files; {} failed:\n{details}",
+            failed.len()
+        )
+    }
+}
+
+/// Renders the `import_message` status banner as a bounded, dismissible
+/// element instead of a bare unwrapped label — a real bug report: importing
+/// many files at once (see `describe_import_batch`) could still produce a
+/// message wide/tall enough to overflow the sidebar, and there was no way
+/// to dismiss it, so it just sat there indefinitely. Wraps to the available
+/// width, caps its height with an internal scrollbar for a many-line
+/// message, and a small "×" clears it.
+fn import_message_banner(ui: &mut egui::Ui, message: &mut Option<String>) {
+    let Some(msg) = message.clone() else {
+        return;
+    };
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.weak("Status");
+            if ui.small_button("\u{d7}").on_hover_text("Dismiss").clicked() {
+                *message = None;
+            }
+        });
+        egui::ScrollArea::vertical()
+            .max_height(80.0)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&msg).weak()).wrap());
+            });
+    });
 }
 
 /// Parses Postman-style bulk-edit text — one `key: value` per line — back
@@ -5689,6 +5905,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx()
             .set_theme(egui_theme_preference(self.settings.theme));
+        theme::apply_postman_visuals(ui.ctx());
         self.poll_responses(ui.ctx());
         self.poll_runner(ui.ctx());
         self.autosave_if_dirty();
@@ -5868,6 +6085,17 @@ impl eframe::App for App {
         self.top_bar(ui);
         if self.sidebar_visible {
             self.sidebar(ui);
+        }
+        // Declared before `self.central(ui)` — side/bottom panels must be
+        // added before the central panel that fills whatever space is left,
+        // matching real Postman's own Console: a collapsible drawer along
+        // the bottom of the window, not a full-screen view.
+        if self.console_open {
+            egui::Panel::bottom("console_bottom_panel")
+                .resizable(true)
+                .default_size(220.0)
+                .min_size(80.0)
+                .show(ui, |ui| self.console_panel(ui));
         }
         self.central(ui);
         self.command_palette(ui.ctx());
@@ -6450,6 +6678,87 @@ mod tests {
             app.active_tab, 1,
             "active_tab clamps down when the last tab is closed"
         );
+    }
+
+    /// `theme::status_color`'s 4-bucket boundaries — specifically the
+    /// off-by-one edges between buckets, since those are exactly where a
+    /// `<`/`<=` mistake would hide.
+    #[test]
+    fn status_color_buckets_by_the_leading_digit_with_correct_edges() {
+        assert_eq!(theme::status_color(200), theme::status_color(299));
+        assert_ne!(theme::status_color(299), theme::status_color(300));
+        assert_eq!(theme::status_color(300), theme::status_color(399));
+        assert_ne!(theme::status_color(399), theme::status_color(400));
+        assert_eq!(theme::status_color(400), theme::status_color(499));
+        assert_ne!(theme::status_color(499), theme::status_color(500));
+        assert_eq!(theme::status_color(500), theme::status_color(599));
+    }
+
+    /// `theme::method_color` gives every method a distinct color except
+    /// HEAD/OPTIONS, which deliberately share one (matching the old
+    /// `method_badge_color` this replaced — moving it into `theme` and
+    /// reusing it more widely shouldn't change what color any method gets).
+    #[test]
+    fn method_color_matches_distinct_per_method_except_head_and_options() {
+        use std::collections::HashSet;
+        let colors: Vec<egui::Color32> = Method::ALL
+            .iter()
+            .map(|m| theme::method_color(*m))
+            .collect();
+        let distinct: HashSet<_> = colors.iter().map(|c| c.to_array()).collect();
+        // 7 methods, HEAD and OPTIONS intentionally share a color -> 6 distinct.
+        assert_eq!(distinct.len(), 6);
+        assert_eq!(
+            theme::method_color(Method::Head),
+            theme::method_color(Method::Options)
+        );
+    }
+
+    /// A small batch keeps the old per-file detail (naming each imported
+    /// collection) — this is the case the original multi-file import
+    /// feature was designed around, and it's short enough to never overflow
+    /// the sidebar.
+    #[test]
+    fn describe_import_batch_joins_small_batches_verbatim() {
+        let results = vec![
+            "Imported Postman collection \"A\"".to_string(),
+            "Imported Postman collection \"B\"".to_string(),
+        ];
+        assert_eq!(
+            describe_import_batch(results),
+            "Imported Postman collection \"A\" | Imported Postman collection \"B\""
+        );
+    }
+
+    /// The real bug report this fixes: importing many files at once used to
+    /// join every single result verbatim, producing a message long enough
+    /// to overflow the sidebar. A large all-success batch now collapses to
+    /// one short line instead.
+    #[test]
+    fn describe_import_batch_summarizes_a_large_all_success_batch() {
+        let results: Vec<String> = (0..10)
+            .map(|i| format!("Imported Postman collection \"Collection {i}\""))
+            .collect();
+        assert_eq!(
+            describe_import_batch(results),
+            "Imported 10 files successfully."
+        );
+    }
+
+    /// A large batch with some failures still calls out exactly which files
+    /// failed and why — the actually useful information — without also
+    /// spelling out every one of the successes.
+    #[test]
+    fn describe_import_batch_lists_only_failures_in_a_large_batch() {
+        let mut results: Vec<String> = (0..8)
+            .map(|i| format!("Imported Postman collection \"Collection {i}\""))
+            .collect();
+        results.push("/tmp/broken.json: import failed: unexpected EOF".to_string());
+        results.push("/tmp/missing.json: Could not read file: not found".to_string());
+        let summary = describe_import_batch(results);
+        assert!(summary.starts_with("Imported 8/10 files; 2 failed:"));
+        assert!(summary.contains("- /tmp/broken.json: import failed: unexpected EOF"));
+        assert!(summary.contains("- /tmp/missing.json: Could not read file: not found"));
     }
 
     /// Pure test for `jump_tab_history`'s walk/skip-stale logic, no `egui::Ui`
@@ -7292,10 +7601,40 @@ mod tests {
                     }],
                 },
             ];
-            state.central_view = CentralView::Console;
+            state.console_open = true;
         }
         harness.step();
         harness.snapshot("phase15_console_panel");
+    }
+
+    /// Phase 17 real Postman-fidelity fix: Console used to be a
+    /// `CentralView` that replaced the whole request/response area — real
+    /// Postman's own Console is a collapsible drawer along the bottom of
+    /// the window that coexists with it. Confirms both the console's own
+    /// content and the request editor's Send button are visible in the same
+    /// frame, not one replacing the other.
+    #[test]
+    #[ignore]
+    fn console_drawer_coexists_with_the_request_editor_not_replacing_it() {
+        use egui_kittest::kittest::Queryable;
+
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.state_mut().console_open = true;
+        harness.step();
+
+        assert!(
+            harness.query_by_label("Send").is_some(),
+            "the request editor should still be visible with the console open"
+        );
+        assert!(
+            harness.query_by_label("Clear console").is_some(),
+            "the console drawer itself should be visible"
+        );
     }
 
     /// Manual/CI-network verification of the actual threading design (the
