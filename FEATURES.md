@@ -357,3 +357,8 @@ AeroSpace, command palette leader-key, tab Console ✅
 - **`space` → `u` → `s`**: tắt/mở sidebar nhanh bằng bàn phím, tương đương
   hệt nút "Hide/Show Sidebar" ở top bar (dùng chung 1 hàm nên hành vi giống
   nhau 100%, kể cả việc không bị tự đóng lại khi cửa sổ đang hẹp).
+- **`space` → `s` → `f` giờ chỉ tìm request, không tìm command nữa** — vì
+  giờ đã có phím riêng cho từng lệnh hay dùng (`se`/`ah`/`us`), nên "sf"
+  quay về đúng nghĩa "tìm request" (search files) thay vì trộn chung với
+  danh sách lệnh, kể cả khi từ khóa gõ vào tình cờ khớp cả tên 1 request
+  lẫn 1 lệnh nào đó.

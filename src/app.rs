@@ -550,6 +550,13 @@ pub struct App {
     search_open: bool,
     search_query: String,
     search_needs_focus: bool,
+    /// `<leader>sf` ("search files", i.e. requests) opens the palette
+    /// showing *only* request entries — no `PaletteAction`s at all — unlike
+    /// `<leader>se`'s combined-but-query-filtered palette. A separate flag
+    /// rather than a third palette-mode enum, since every other chord that
+    /// opens this same window wants the full action+request list, just
+    /// pre-filtered by its own query text.
+    palette_requests_only: bool,
     /// Which entry in the command palette's filtered list is highlighted —
     /// `Ctrl+N`/`Ctrl+P` (Emacs-style) move it, Enter picks whichever one
     /// this points at. Reset to `0` whenever the palette opens or the
@@ -693,6 +700,7 @@ impl App {
             search_open: false,
             search_query: String::new(),
             search_needs_focus: false,
+            palette_requests_only: false,
             palette_selected: 0,
             fuzzy_matcher: nucleo_matcher::Matcher::default(),
             last_screen_size: None,
@@ -2544,7 +2552,12 @@ impl App {
         let mut selected: Option<PaletteEntry> = None;
         let mut close = false;
 
-        egui::Window::new("Search Requests & Commands")
+        let title = if self.palette_requests_only {
+            "Search Requests"
+        } else {
+            "Search Requests & Commands"
+        };
+        egui::Window::new(title)
             .id(egui::Id::new("search_palette_window"))
             .open(&mut still_open)
             .collapsible(false)
@@ -2552,9 +2565,14 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
             .default_width(520.0)
             .show(ctx, |ui| {
+                let hint = if self.palette_requests_only {
+                    "Search requests\u{2026}"
+                } else {
+                    "Search requests or type a command\u{2026}"
+                };
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search requests or type a command\u{2026}")
+                        .hint_text(hint)
                         .desired_width(f32::INFINITY),
                 );
                 if self.search_needs_focus {
@@ -2580,14 +2598,21 @@ impl App {
                 // score tied at 0) preserves today's original insertion
                 // order, so "show everything, unranked" looks the same as
                 // before; only an actual query reorders anything.
-                let mut scored: Vec<(u32, PaletteEntry)> = self
-                    .palette_actions()
-                    .into_iter()
-                    .filter_map(|(label, action)| {
-                        let score = fuzzy_score(&mut self.fuzzy_matcher, &label, &query)?;
-                        Some((score, PaletteEntry::Action { label, action }))
-                    })
-                    .collect();
+                // `<leader>sf` ("search files", i.e. requests) shows no
+                // commands at all — `palette_requests_only` skips scoring
+                // the action list entirely rather than scoring-then-hiding
+                // it, so it can never leak in via a lucky fuzzy match.
+                let mut scored: Vec<(u32, PaletteEntry)> = if self.palette_requests_only {
+                    Vec::new()
+                } else {
+                    self.palette_actions()
+                        .into_iter()
+                        .filter_map(|(label, action)| {
+                            let score = fuzzy_score(&mut self.fuzzy_matcher, &label, &query)?;
+                            Some((score, PaletteEntry::Action { label, action }))
+                        })
+                        .collect()
+                };
 
                 for c in &self.data.collections {
                     for r in &c.requests {
@@ -6111,6 +6136,12 @@ impl eframe::App for App {
                                     self.search_query.clear();
                                     self.search_needs_focus = true;
                                     self.palette_selected = 0;
+                                    // "Search files" — requests only, no
+                                    // commands, per explicit request: this
+                                    // chord is for jumping straight to a
+                                    // request, not a mixed action+request
+                                    // list.
+                                    self.palette_requests_only = true;
                                 }
                             }
                             LeaderAction::SelectEnvironment => {
@@ -6122,6 +6153,10 @@ impl eframe::App for App {
                                 self.search_query = "Environment:".to_string();
                                 self.search_needs_focus = true;
                                 self.palette_selected = 0;
+                                // Needs the action entries visible at all —
+                                // unlike `<leader>sf`, this isn't a
+                                // requests-only view.
+                                self.palette_requests_only = false;
                             }
                             LeaderAction::AssignHotkeyToActiveRequest => {
                                 self.pending_hotkey_assignment =
@@ -8140,6 +8175,53 @@ mod tests {
         assert!(
             harness.state().search_open,
             "space, then s, then f should open the command palette"
+        );
+        assert!(
+            harness.state().palette_requests_only,
+            "<leader>sf is the requests-only view, not the combined one"
+        );
+    }
+
+    /// `<leader>sf` shows *only* request entries — no `PaletteAction`s at
+    /// all, even for a query that would otherwise fuzzy-match one — unlike
+    /// `<leader>se`, which reuses this same window just pre-filtered by its
+    /// own query text (both actions and requests still candidates there).
+    #[test]
+    #[ignore]
+    fn leader_key_space_s_f_shows_requests_only_no_commands() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Theme Park API"));
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.key_press(egui::Key::F);
+        harness.step();
+
+        // "theme" fuzzy-matches both the request "Theme Park API" and the
+        // "Theme: Dark"/"Theme: Light"/"Theme: System" actions — the actual
+        // case this flag exists to prevent.
+        harness.state_mut().search_query = "theme".to_string();
+        harness.step();
+        harness.step();
+
+        assert!(
+            harness.query_by_label("Theme Park API").is_some(),
+            "the matching request should still show up"
+        );
+        assert!(
+            harness.query_by_label("> Theme: Dark").is_none(),
+            "no action should show up in the requests-only view, even one that fuzzy-matches"
         );
     }
 
