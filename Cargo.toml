@@ -9,7 +9,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 cookie_store = "=0.22.1"
 csv = "1.4.0"
 dirs = "6.0.0"
-eframe = { version = "0.35.0", features = ["accesskit"] }
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui = "0.35.0"
 egui_extras = "0.35.0"
 hex = "0.4.3"

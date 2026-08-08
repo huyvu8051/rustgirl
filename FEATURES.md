@@ -368,3 +368,13 @@ AeroSpace, command palette leader-key, tab Console ✅
   tự cuộn để luôn thấy dòng đang chọn, nhưng chỉ cuộn đúng lúc vừa bấm
   Ctrl+N/P (không cuộn liên tục mỗi frame) để không phá việc tự cuộn tay
   bằng chuột.
+- **Đổi renderer từ wgpu sang glow (OpenGL) để giảm RAM** — egui/eframe
+  không có đường vẽ bằng CPU cho app desktop, luôn phải qua GPU; nhưng
+  wgpu (Vulkan/Metal, mặc định của eframe) tốn RAM hơn glow (OpenGL) do có
+  thêm lớp validation/buffer. Đã đo thực tế trên máy (build debug, chạy
+  song song 2 bản để so sánh): wgpu ổn định ở ~123MB RSS lúc rảnh, glow
+  ~104-117MB — số liệu 1 lần đo trên 1 máy, không phải benchmark chuẩn,
+  nhưng hướng giảm là nhất quán mỗi lần thử. Bộ test snapshot không đổi gì
+  cả (`egui_kittest` dùng renderer test riêng của nó, độc lập với app thật)
+  — chạy lại toàn bộ và xác nhận không có snapshot nào lệch, ngoài 2 cái
+  lệch timestamp đã biết từ trước.
