@@ -657,17 +657,7 @@ impl App {
         cookie_jar: std::sync::Arc<CookieStoreMutex>,
     ) -> Self {
         migrate_number_shortcuts_to_hotkey_bindings(&mut data);
-        // `new_multi_thread()` defaults to one worker thread per logical
-        // CPU core (12 on this machine) — a real, measured waste for a
-        // workload that's a handful of concurrent HTTP awaits and the
-        // Runner's own already-sequential `std::thread::spawn` loop
-        // (Phase 9), never actual parallel CPU work across many cores.
-        // Each unused worker is a real OS thread with its own stack;
-        // capping this is one of a small set of changes verified with a
-        // real before/after `vmmap --summary` measurement (see the
-        // Phase 17 plan notes), not applied on assumption alone.
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
             .enable_all()
             .build()
             .expect("failed to create tokio runtime");

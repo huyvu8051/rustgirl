@@ -381,13 +381,3 @@ AeroSpace, command palette leader-key, tab Console ✅
   - Vụ đổi renderer wgpu→glow trước đó (không giúp được gì thật sự, đo lại
     kỹ hơn thấy chênh chưa tới 2%) đã được **revert** — đây mới là fix
     thật sự đáng kể.
-- **Đã thử tối ưu thêm nhưng không ăn thua** — tokio mặc định tạo 1 worker
-  thread cho mỗi lõi CPU (máy này 12 lõi = 12 thread!) cho 1 app chỉ chờ
-  vài request HTTP, chẳng cần chạy song song nhiều lõi gì cả. Đã giới hạn
-  lại còn 2 worker thread + gọn lại danh sách feature của tokio (bỏ
-  `"full"`, chỉ giữ đúng thứ app dùng thật). Đo lại: **không giảm thêm
-  RAM được nữa** (~78.8MB, gần như y hệt trước) — số thread giảm nhưng
-  không ảnh hưởng nhiều tới RAM thật vì thread rảnh không đụng tới stack
-  của nó. Vẫn giữ thay đổi này vì đúng với nhu cầu thật của app (không mất
-  gì cả), nhưng xác nhận: **đã hết dư địa tối ưu RAM đáng kể**, cái fix ở
-  trên (~250MB→~78MB) là phần lớn nhất rồi.
