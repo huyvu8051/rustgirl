@@ -5482,9 +5482,19 @@ fn render_folder_row(
                     expanded.insert(folder_id);
                 }
             }
-            // See the collection row's identical addition for why this is
-            // back as a visible button, not just the context-menu entry.
+            // See the collection row's identical addition for why "+" is
+            // back as a visible button, not just the context-menu entry —
+            // same reasoning for "🗑" (delete), added right after it:
+            // requested directly once someone actually went looking for it
+            // and found it only reachable via right-click.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, "🗑", &format!("Delete folder \"{name}\"")).clicked() {
+                    actions.push(PendingAction::DeleteFolder {
+                        collection: collection_id,
+                        parent_path: parent_path.to_vec(),
+                        id: folder_id,
+                    });
+                }
                 if ui.small_button("+").on_hover_text("Add request").clicked() {
                     actions.push(PendingAction::AddRequest {
                         collection: collection_id,
@@ -5669,6 +5679,20 @@ fn render_request_row(
                     id: req_id,
                 });
             }
+            // A visible quick-delete, not just the context-menu entry
+            // below — requested directly once someone actually went
+            // looking for it and found it only reachable via right-click
+            // (the same discoverability fix already applied to the
+            // collection/folder rows' own "+" button).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, "🗑", &format!("Delete request \"{name}\"")).clicked() {
+                    actions.push(PendingAction::DeleteRequest {
+                        collection: collection_id,
+                        folder_path: folder_path.to_vec(),
+                        id: req_id,
+                    });
+                }
+            });
         }
     });
 
