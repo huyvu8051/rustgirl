@@ -635,6 +635,11 @@ pub struct App {
     /// bottom panels must be declared before the central panel that fills
     /// whatever space is left).
     console_open: bool,
+    /// Whether the console drawer shows its full scrollable history or just
+    /// a single compact line for the newest entry — starts collapsed so the
+    /// always-visible drawer stays out of the way by default; clicking the
+    /// compact line (or the newest entry's row once expanded) toggles it.
+    console_expanded: bool,
 }
 
 impl App {
@@ -721,7 +726,12 @@ impl App {
             sidebar_was_narrow: false,
             tab_jump_history: Vec::new(),
             tab_jump_cursor: 0,
-            console_open: false,
+            // Always visible by default (matches real Postman's own Console,
+            // which sits along the bottom of the window all the time) —
+            // starts collapsed to a single compact line via
+            // `console_expanded: false` above, not fully hidden.
+            console_open: true,
+            console_expanded: false,
         }
     }
 
@@ -4153,12 +4163,37 @@ impl App {
     /// Session-only (cleared here doesn't touch the durable `console.log`
     /// text file `push_console_entry` also writes to on every send).
     fn console_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.console_expanded {
+            // Collapsed (the default): nothing but a single neat line for
+            // the newest entry — no "Console" heading, no "×", no "Clear
+            // console", just the log line itself. Click it to expand.
+            if self.console.is_empty() {
+                ui.weak("Nothing sent yet this session.");
+                return;
+            }
+            let row = console_entry_row(ui, &self.console[0]);
+            if row
+                .interact(egui::Sense::click())
+                .on_hover_text("Click to expand")
+                .clicked()
+            {
+                self.console_expanded = true;
+            }
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.heading("Console");
             if ui.small_button("\u{d7}").on_hover_text("Close").clicked() {
                 self.console_open = false;
             }
         });
+
+        if self.console.is_empty() {
+            ui.weak("Nothing sent yet this session.");
+            return;
+        }
+
         ui.horizontal(|ui| {
             if ui.button("Clear console").clicked() {
                 self.console.clear();
@@ -4169,11 +4204,6 @@ impl App {
             ));
         });
         ui.separator();
-
-        if self.console.is_empty() {
-            ui.weak("Nothing sent yet this session.");
-            return;
-        }
 
         // Only jump the scroll position on the frame a new entry actually
         // arrives (not every frame) — otherwise this would fight a manual
@@ -4186,26 +4216,21 @@ impl App {
             // `data.history`'s "most recent at the top" convention) — a new
             // send should appear right at the top, not scrolled past.
             for (idx, entry) in self.console.iter().enumerate() {
-                let status_text = match (entry.status, &entry.error) {
-                    (Some(status), _) => format!("{status}"),
-                    (None, Some(err)) => format!("ERROR: {err}"),
-                    (None, None) => "(no response)".to_string(),
-                };
-                let color = match entry.status {
-                    Some(s) => theme::status_color(s),
-                    None => egui::Color32::RED,
-                };
-                let row = ui.horizontal(|ui| {
-                    ui.weak(entry.timestamp.format("%H:%M:%S").to_string());
-                    ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
-                    ui.label(&entry.url);
-                    ui.colored_label(color, status_text);
-                    if let Some(ms) = entry.duration_ms {
-                        ui.weak(format!("{ms}ms"));
+                let row = console_entry_row(ui, entry);
+                if idx == 0 {
+                    if should_scroll_to_newest {
+                        row.scroll_to_me(Some(egui::Align::TOP));
                     }
-                });
-                if idx == 0 && should_scroll_to_newest {
-                    row.response.scroll_to_me(Some(egui::Align::TOP));
+                    // Clicking the newest entry's row again toggles back to
+                    // the collapsed single-line view — the same row is the
+                    // toggle target whether collapsed or expanded.
+                    if row
+                        .interact(egui::Sense::click())
+                        .on_hover_text("Click to collapse")
+                        .clicked()
+                    {
+                        self.console_expanded = false;
+                    }
                 }
                 for line in &entry.script_log {
                     ui.monospace(format!("  console.log: {line}"));
@@ -5171,6 +5196,32 @@ fn migrate_number_shortcuts_to_hotkey_bindings(data: &mut AppData) {
         let key = char::from_digit(i as u32 + 1, 10).expect("0..9 always converts");
         data.hotkey_bindings.insert(key, req.id);
     }
+}
+
+/// One line of the Console — timestamp, colored method, url, colored
+/// status/error, duration. Shared by `console_panel`'s compact single-line
+/// view (the newest entry) and its expanded full-history list, so the two
+/// never drift apart in what they show for the same entry.
+fn console_entry_row(ui: &mut egui::Ui, entry: &ConsoleEntry) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.weak(entry.timestamp.format("%H:%M:%S").to_string());
+        ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
+        ui.label(&entry.url);
+        let status_text = match (entry.status, &entry.error) {
+            (Some(status), _) => format!("{status}"),
+            (None, Some(err)) => format!("ERROR: {err}"),
+            (None, None) => "(no response)".to_string(),
+        };
+        let color = match entry.status {
+            Some(s) => theme::status_color(s),
+            None => egui::Color32::RED,
+        };
+        ui.colored_label(color, status_text);
+        if let Some(ms) = entry.duration_ms {
+            ui.weak(format!("{ms}ms"));
+        }
+    })
+    .response
 }
 
 /// Recursively inserts every folder's own id (at every depth) into
@@ -8045,6 +8096,7 @@ mod tests {
                 },
             ];
             state.console_open = true;
+            state.console_expanded = true;
         }
         harness.step();
         harness.snapshot("phase15_console_panel");
@@ -8074,8 +8126,15 @@ mod tests {
             harness.query_by_label("Send").is_some(),
             "the request editor should still be visible with the console open"
         );
+        // No sends happened in this test, so the drawer shows its
+        // empty-state message rather than "Clear console" (only present
+        // once there's an entry to clear) — either way proves the drawer
+        // itself rendered alongside the request editor, which is this
+        // test's actual point.
         assert!(
-            harness.query_by_label("Clear console").is_some(),
+            harness
+                .query_by_label("Nothing sent yet this session.")
+                .is_some(),
             "the console drawer itself should be visible"
         );
     }
