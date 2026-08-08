@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustGirl — a native HTTP client, forged in Rust</title>
+<meta name="description" content="RustGirl is a Postman-style HTTP client built entirely in Rust with egui/eframe. One small native binary — no Electron, no webview. Collections, environments, Lua scripting, and a response viewer that doesn't lag.">
+<link rel="canonical" href="https://rustgirl.opendiy.vn/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="RustGirl">
+<meta property="og:title" content="RustGirl — a native HTTP client, forged in Rust">
+<meta property="og:description" content="A Postman-style HTTP client built entirely in Rust with egui/eframe. One small binary — no Electron, no webview, no bloat.">
+<meta property="og:url" content="https://rustgirl.opendiy.vn/">
+<meta property="og:image" content="https://rustgirl.opendiy.vn/assets/hero-runner.png">
+<meta property="og:image:width" content="1100">
+<meta property="og:image:height" content="750">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="RustGirl — a native HTTP client, forged in Rust">
+<meta name="twitter:description" content="A Postman-style HTTP client built entirely in Rust with egui/eframe. One small binary — no Electron, no webview, no bloat.">
+<meta name="twitter:image" content="https://rustgirl.opendiy.vn/assets/hero-runner.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "RustGirl",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Windows, Linux",
+  "description": "A Postman-style HTTP client built entirely in Rust with egui/eframe. One small native binary — no Electron, no webview.",
+  "url": "https://rustgirl.opendiy.vn/",
+  "license": "https://github.com/huyvu8051/rustgirl/blob/master/LICENSE",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  },
+  "codeRepository": "https://github.com/huyvu8051/rustgirl"
+}
+</script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2218%22 fill=%22%2315120F%22/><text x=%2250%22 y=%2266%22 font-size=%2258%22 text-anchor=%22middle%22 fill=%22%23B5451B%22 font-family=%22Georgia,serif%22 font-weight=%22bold%22>R</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
+<style>
+  :root{
+    --iron: #15120F;
+    --charcoal: #1E1A16;
+    --charcoal-2: #262019;
+    --rust-500: #B5451B;
+    --rust-300: #E8823D;
+    --steel-400: #93999f;
+    --steel-600: #5c6268;
+    --paper-100: #F3EDE4;
+    --paper-60: rgba(243,237,228,0.62);
+    --paper-30: rgba(243,237,228,0.14);
+    --display: "Big Shoulders Display", sans-serif;
+    --body: "IBM Plex Sans", sans-serif;
+    --mono: "JetBrains Mono", monospace;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto;}
+    *{animation-duration:0.01ms !important; transition-duration:0.01ms !important;}
+  }
+  html, body{overflow-x:hidden;}
+  body{
+    margin:0;
+    background:var(--iron);
+    color:var(--paper-100);
+    font-family:var(--body);
+    font-size:16px;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  img{max-width:100%; height:auto; display:block;}
+  picture{display:block;}
+  a{color:inherit;}
+  ::selection{background:var(--rust-500); color:var(--paper-100);}
+  :focus-visible{outline:2px solid var(--rust-300); outline-offset:3px;}
+
+  .wrap{max-width:1180px; margin:0 auto; padding:0 32px;}
+  @media (max-width:600px){ .wrap{padding:0 20px;} }
+
+  /* ---------- nav ---------- */
+  header.nav{
+    position:sticky; top:0; z-index:50;
+    background:rgba(21,18,15,0.86);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--paper-30);
+  }
+  .nav-inner{display:flex; align-items:center; justify-content:space-between; height:68px;}
+  .wordmark{
+    font-family:var(--display); font-weight:800; font-size:26px; letter-spacing:0.01em;
+    text-decoration:none; color:var(--paper-100);
+    text-shadow: 0 1px 0 rgba(0,0,0,0.6), 0 -1px 0 rgba(232,130,61,0.25);
+  }
+  .wordmark span{color:var(--rust-500);}
+  nav.links{display:flex; gap:28px; font-size:14.5px; font-weight:500;}
+  nav.links a{text-decoration:none; color:var(--paper-60); transition:color .2s ease;}
+  nav.links a:hover{color:var(--rust-300);}
+  @media (max-width:700px){
+    nav.links{display:none;}
+    .nav-inner .btn-primary{padding:9px 16px; font-size:13.5px;}
+  }
+  .btn{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:11px 22px; border-radius:6px; font-weight:600; font-size:14.5px;
+    text-decoration:none; border:1px solid transparent; cursor:pointer;
+    font-family:var(--body);
+  }
+  .btn-primary{
+    color:var(--paper-100);
+    background:linear-gradient(100deg, var(--steel-600) 0%, var(--rust-500) 45%, var(--rust-500) 100%);
+    background-size:220% 100%; background-position:100% 0;
+    transition:background-position .45s ease, transform .15s ease;
+    box-shadow:0 8px 24px -8px rgba(181,69,27,0.55);
+  }
+  .btn-primary:hover{background-position:0% 0; transform:translateY(-1px);}
+  .btn-ghost{
+    color:var(--paper-100); border-color:var(--paper-30); background:transparent;
+    transition:border-color .2s ease, background .2s ease;
+  }
+  .btn-ghost:hover{border-color:var(--rust-300); background:rgba(232,130,61,0.08);}
+
+  /* ---------- hero ---------- */
+  .hero{position:relative; overflow:hidden; padding:96px 0 80px;}
+  .hero-grain{position:absolute; inset:0; opacity:0.16; mix-blend-mode:overlay; pointer-events:none;}
+  .hero-glow{
+    position:absolute; inset:-20% -10% auto -10%; height:520px;
+    background:radial-gradient(60% 100% at 30% 0%, rgba(181,69,27,0.35), transparent 70%);
+    pointer-events:none;
+  }
+  .hero-grid{position:relative; display:grid; grid-template-columns:1.05fr 1fr; gap:56px; align-items:center;}
+  @media (max-width:940px){ .hero-grid{grid-template-columns:1fr;} }
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:12.5px; color:var(--rust-300);
+    letter-spacing:0.08em; text-transform:uppercase;
+    border:1px solid rgba(232,130,61,0.35); padding:6px 12px; border-radius:100px;
+    background:rgba(232,130,61,0.08);
+  }
+  .eyebrow .dot{width:6px; height:6px; border-radius:50%; background:var(--rust-300); box-shadow:0 0 8px var(--rust-300);}
+  h1{
+    font-family:var(--display); font-weight:800; text-transform:uppercase;
+    font-size:clamp(40px, 6vw, 68px); line-height:0.98; letter-spacing:-0.01em;
+    margin:22px 0 20px;
+  }
+  h1 em{
+    font-style:normal; color:var(--rust-500);
+    text-shadow:0 2px 0 rgba(0,0,0,0.5);
+  }
+  .hero p.lede{font-size:18px; color:var(--paper-60); max-width:52ch; margin:0 0 32px;}
+  .hero-ctas{display:flex; gap:14px; flex-wrap:wrap; margin-bottom:40px;}
+  .hero-stats{display:flex; gap:28px; flex-wrap:wrap; font-family:var(--mono);}
+  .hero-stats div{display:flex; flex-direction:column; gap:2px;}
+  .hero-stats b{font-size:20px; color:var(--paper-100);}
+  .hero-stats span{font-size:12px; color:var(--paper-60); text-transform:uppercase; letter-spacing:0.05em;}
+
+  .window{
+    border-radius:10px; overflow:hidden; border:1px solid rgba(243,237,228,0.12);
+    background:var(--charcoal); box-shadow:0 30px 70px -20px rgba(0,0,0,0.7), 0 0 0 1px rgba(181,69,27,0.15);
+    transform:rotate(0.4deg);
+  }
+  .window-bar{display:flex; align-items:center; gap:7px; padding:11px 14px; background:var(--charcoal-2); border-bottom:1px solid rgba(243,237,228,0.08);}
+  .window-bar i{width:10px; height:10px; border-radius:50%; display:inline-block; background:var(--steel-600);}
+  .window-bar i:nth-child(1){background:#8a5c4a;}
+  .window-bar i:nth-child(2){background:#b98a4a;}
+  .window-bar i:nth-child(3){background:#5c7a5f;}
+  .window img{width:100%; display:block;}
+
+  /* ---------- crack divider ---------- */
+  .crack{display:block; width:100%; height:28px; margin:0;}
+  .crack path{stroke:rgba(181,69,27,0.45); stroke-width:1.5; fill:none;}
+
+  section{padding:88px 0;}
+  .section-head{max-width:640px; margin:0 0 56px;}
+  .kicker{font-family:var(--mono); font-size:12.5px; color:var(--rust-300); text-transform:uppercase; letter-spacing:0.1em;}
+  h2{font-family:var(--display); font-weight:800; text-transform:uppercase; font-size:clamp(28px,3.6vw,42px); margin:10px 0 14px; letter-spacing:-0.005em;}
+  .section-head p{color:var(--paper-60); font-size:16.5px; max-width:56ch;}
+
+  /* ---------- features ---------- */
+  .feature-row{display:grid; grid-template-columns:1fr 1fr; gap:60px; align-items:center; padding:56px 0; border-top:1px solid var(--paper-30);}
+  .feature-row:first-of-type{border-top:none;}
+  .feature-row.reverse .feature-copy{order:2;}
+  .feature-row.reverse .feature-shot{order:1;}
+  @media (max-width:860px){
+    .feature-row, .feature-row.reverse{grid-template-columns:1fr;}
+    .feature-row.reverse .feature-copy, .feature-row.reverse .feature-shot{order:0;}
+  }
+  .feature-copy h3{font-family:var(--display); font-weight:700; text-transform:uppercase; font-size:26px; margin:0 0 12px; letter-spacing:0.01em;}
+  .feature-copy p{color:var(--paper-60); font-size:16px; margin:0;}
+  .feature-shot{
+    border-radius:10px; overflow:hidden; border:1px solid rgba(243,237,228,0.1);
+    box-shadow:0 20px 50px -18px rgba(0,0,0,0.6);
+  }
+  .feature-shot img{width:100%;}
+
+  /* ---------- stack ---------- */
+  .stack-chips{display:flex; flex-wrap:wrap; gap:12px;}
+  .chip{
+    font-family:var(--mono); font-size:13.5px; padding:9px 16px; border-radius:6px;
+    border:1px solid var(--paper-30); color:var(--paper-60); background:var(--charcoal);
+  }
+  .chip b{color:var(--paper-100); font-weight:600;}
+
+  /* ---------- install ---------- */
+  .install-card{
+    background:var(--charcoal); border:1px solid var(--paper-30); border-radius:12px;
+    padding:8px; max-width:720px;
+  }
+  .install-bar{display:flex; align-items:center; justify-content:space-between; padding:10px 14px 6px;}
+  .install-bar span{font-family:var(--mono); font-size:12.5px; color:var(--paper-60);}
+  .copy-btn{
+    font-family:var(--mono); font-size:12.5px; color:var(--rust-300); background:transparent;
+    border:1px solid rgba(232,130,61,0.35); border-radius:6px; padding:5px 10px; cursor:pointer;
+    transition:background .2s ease;
+  }
+  .copy-btn:hover{background:rgba(232,130,61,0.1);}
+  pre.code{
+    font-family:var(--mono); font-size:14px; line-height:1.7; color:var(--paper-100);
+    margin:0; padding:14px 18px 18px; overflow-x:auto;
+  }
+  pre.code .c{color:var(--paper-60);}
+  pre.code .g{color:#8fbf8a;}
+
+  /* ---------- footer ---------- */
+  footer{border-top:1px solid var(--paper-30); padding:40px 0;}
+  .footer-inner{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;}
+  footer p{color:var(--paper-60); font-size:13.5px; margin:0; font-family:var(--mono);}
+  footer a{text-decoration:none; color:var(--paper-60); transition:color .2s ease;}
+  footer a:hover{color:var(--rust-300);}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="wordmark" href="#top">Rust<span>Girl</span></a>
+    <nav class="links">
+      <a href="#features">Features</a>
+      <a href="#stack">Stack</a>
+      <a href="#install">Install</a>
+    </nav>
+    <a class="btn btn-primary" href="https://github.com/huyvu8051/rustgirl" target="_blank" rel="noopener">View on GitHub</a>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <svg class="hero-grain" aria-hidden="true" width="100%" height="100%" preserveAspectRatio="none">
+      <filter id="rustGrain"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" stitchTiles="stitch" result="n"/><feColorMatrix in="n" type="matrix" values="0 0 0 0 0.71  0 0 0 0 0.35  0 0 0 0 0.15  0 0 0 0.65 0"/></filter>
+      <rect width="100%" height="100%" filter="url(#rustGrain)"/>
+    </svg>
+    <div class="hero-glow"></div>
+    <div class="wrap hero-grid">
+      <div>
+        <span class="eyebrow"><span class="dot"></span> MIT · macOS · Windows · Linux</span>
+        <h1>A native HTTP<br>client, forged<br>in <em>Rust</em>.</h1>
+        <p class="lede">RustGirl is a Postman-style API client built entirely in Rust with egui/eframe. One small binary — no Electron, no webview, no background updater. Just requests, collections, and a response viewer that keeps up with you.</p>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/huyvu8051/rustgirl" target="_blank" rel="noopener">Get the source →</a>
+          <a class="btn btn-ghost" href="#install">Clone &amp; run it</a>
+        </div>
+        <div class="hero-stats">
+          <div><b>~20 MB</b><span>Release binary</span></div>
+          <div><b>0</b><span>Electron / webview deps</span></div>
+          <div><b>100%</b><span>Rust</span></div>
+          <div><b>MIT</b><span>License</span></div>
+        </div>
+      </div>
+      <div class="window">
+        <div class="window-bar"><i></i><i></i><i></i></div>
+        <picture><source srcset="assets/hero-runner.webp" type="image/webp"><img src="assets/hero-runner.png" width="1100" height="750" alt="RustGirl running a collection: two requests sent, a 200 and a 500 response, with test results shown inline" loading="eager"></picture>
+      </div>
+    </div>
+  </section>
+
+  <svg class="crack" viewBox="0 0 1200 28" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,14 L120,14 L140,4 L160,20 L210,10 L260,16 L310,6 L370,18 L420,12 L480,22 L540,8 L610,14 L680,4 L740,18 L800,10 L860,16 L920,6 L980,20 L1040,12 L1100,16 L1200,14"/>
+  </svg>
+
+  <section id="features">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker">What it does</span>
+        <h2>Everything a Postman tab does, none of the weight it carries.</h2>
+        <p>Every screen below is a real screenshot from RustGirl's own headless test suite — this is exactly what you get, not a mockup.</p>
+      </div>
+
+      <div class="feature-row">
+        <div class="feature-copy">
+          <h3>Every request is already a curl command</h3>
+          <p>Switch to the Code tab and RustGirl writes the equivalent curl for you — headers, auth, and body included. Copy it straight into a script, a bug report, or a teammate's DM.</p>
+        </div>
+        <div class="feature-shot"><picture><source srcset="assets/feature-code.webp" type="image/webp"><img src="assets/feature-code.png" width="1100" height="750" alt="Code tab showing a generated curl command for a POST request with headers and a JSON body" loading="lazy"></picture></div>
+      </div>
+
+      <div class="feature-row reverse">
+        <div class="feature-copy">
+          <h3>Jump to any request without touching the mouse</h3>
+          <p>Option/Alt+Space opens a fuzzy search across every collection you have. Type a few letters of a request name, an endpoint, or a theme setting — it's all in the same palette.</p>
+        </div>
+        <div class="feature-shot"><picture><source srcset="assets/feature-quickopen.webp" type="image/webp"><img src="assets/feature-quickopen.png" width="1100" height="750" alt="Command palette open, fuzzy-searching 'theme' and showing matching theme and request commands" loading="lazy"></picture></div>
+      </div>
+
+      <div class="feature-row">
+        <div class="feature-copy">
+          <h3>Nest folders as deep as your API actually is</h3>
+          <p>Drag to reorder, right-click to rename or duplicate, and organize collections the way your API is actually shaped — not the way a flat list forces you to.</p>
+        </div>
+        <div class="feature-shot"><picture><source srcset="assets/feature-collections.webp" type="image/webp"><img src="assets/feature-collections.png" width="1100" height="750" alt="Collection tree with a Demo collection expanded into an Auth folder containing Login and Tokens requests" loading="lazy"></picture></div>
+      </div>
+
+      <div class="feature-row reverse">
+        <div class="feature-copy">
+          <h3>Script requests with Lua, not a walled-off DSL</h3>
+          <p>Pre-request and post-response scripting through a <code>pm.*</code> API modeled on Postman's — set variables, run assertions, or fire a follow-up request from inside a real, sandboxed Lua interpreter.</p>
+        </div>
+        <div class="feature-shot"><picture><source srcset="assets/feature-scripting.webp" type="image/webp"><img src="assets/feature-scripting.png" width="1100" height="750" alt="Tests tab with Lua scripting snippet buttons for pm.test, pm.environment.set, and console.log" loading="lazy"></picture></div>
+      </div>
+
+      <div class="feature-row">
+        <div class="feature-copy">
+          <h3>Light, dark, or whatever your OS is already doing</h3>
+          <p>One setting, applied everywhere immediately — no restart, no flash of the wrong theme.</p>
+        </div>
+        <div class="feature-shot"><picture><source srcset="assets/feature-theme.webp" type="image/webp"><img src="assets/feature-theme.png" width="1100" height="750" alt="RustGirl settings panel in light theme, showing theme, proxy, and TLS options" loading="lazy"></picture></div>
+      </div>
+    </div>
+  </section>
+
+  <svg class="crack" viewBox="0 0 1200 28" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,10 L90,18 L150,8 L200,20 L260,12 L330,22 L390,6 L450,16 L510,10 L580,20 L650,8 L720,18 L790,12 L860,22 L930,6 L1000,16 L1070,10 L1140,20 L1200,12"/>
+  </svg>
+
+  <section id="stack">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker">Under the hood</span>
+        <h2>No runtime to ship, no VM to boot.</h2>
+        <p>The Lua interpreter is vendored and built from source by <code>mlua</code> — there's no system Lua to install, and nothing besides a C compiler on Linux.</p>
+      </div>
+      <div class="stack-chips">
+        <span class="chip"><b>Rust</b> 1.85+, edition 2024</span>
+        <span class="chip"><b>egui / eframe</b> — native UI, no webview</span>
+        <span class="chip"><b>reqwest</b> + <b>tokio</b> — async HTTP</span>
+        <span class="chip"><b>mlua</b> — vendored Lua 5.4</span>
+        <span class="chip"><b>rfd</b> — native file dialogs</span>
+        <span class="chip"><b>AccessKit</b> — screen-reader labels</span>
+      </div>
+    </div>
+  </section>
+
+  <svg class="crack" viewBox="0 0 1200 28" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,16 L110,8 L170,20 L230,10 L290,18 L350,6 L410,16 L470,10 L540,20 L610,8 L680,18 L750,12 L820,22 L890,6 L960,16 L1030,10 L1100,20 L1200,14"/>
+  </svg>
+
+  <section id="install">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="kicker">Get started</span>
+        <h2>Clone it, run it, keep it.</h2>
+        <p>Requires Rust 1.85+. No account, no telemetry, no installer to trust.</p>
+      </div>
+      <div class="install-card">
+        <div class="install-bar">
+          <span>terminal</span>
+          <button class="copy-btn" onclick="copyInstall(this)">Copy</button>
+        </div>
+        <pre class="code" id="install-code"><span class="c">$</span> git clone https://github.com/huyvu8051/rustgirl.git
+<span class="c">$</span> cd rustgirl
+<span class="c">$</span> cargo run --release
+<span class="c">   </span><span class="g">Finished</span> release profile — RustGirl opens as a native window</pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap footer-inner">
+    <p>MIT licensed · built with Rust, egui, and an appropriate amount of oxidation.</p>
+    <p><a href="https://github.com/huyvu8051/rustgirl" target="_blank" rel="noopener">github.com/huyvu8051/rustgirl</a></p>
+  </div>
+</footer>
+
+<script>
+function copyInstall(btn){
+  var text = "git clone https://github.com/huyvu8051/rustgirl.git\ncd rustgirl\ncargo run --release";
+  navigator.clipboard.writeText(text).then(function(){
+    var old = btn.textContent;
+    btn.textContent = "Copied";
+    setTimeout(function(){ btn.textContent = old; }, 1600);
+  });
+}
+</script>
+</body>
+</html>
