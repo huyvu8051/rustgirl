@@ -3271,6 +3271,23 @@ impl App {
         tab.autosave_last_saved_at = Some(std::time::Instant::now());
     }
 
+    /// Whether any *collection-backed* tab has edits pending within the
+    /// autosave debounce window — the one case worth keeping the UI
+    /// repainting for (see `fn ui`'s own use of this). Deliberately
+    /// excludes `Unsaved`-origin tabs: `autosave_if_dirty` never writes them
+    /// (there's no file slot to write into), so their `is_dirty()` is
+    /// permanently `true` and would otherwise mean "keep repainting
+    /// forever" for the entire lifetime of any app that has one open — a
+    /// real, measured bug (confirmed via `ps`/`vmmap`: ~20-24% CPU at true
+    /// idle, and a GPU/graphics memory footprint of ~170MB+ that never got
+    /// to settle back down, vs. 0% CPU and ~5MB once fixed), not a
+    /// hypothetical one.
+    fn has_savable_dirty_tab(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| !matches!(t.origin, RequestOrigin::Unsaved) && t.is_dirty())
+    }
+
     /// Called every frame: transparently persists edits to every open,
     /// already-saved tab (not just the active one — a background tab's
     /// edits should still autosave) without needing the Save button. Writes
@@ -6329,14 +6346,10 @@ impl eframe::App for App {
         // Ctrl+Tab, ...) into the jumplist in one place, rather than each
         // of those call sites needing to remember to record it themselves.
         self.record_tab_jump_if_changed();
-        if self.tabs.iter().any(OpenTab::is_dirty) {
+        if self.has_savable_dirty_tab() {
             // Edits are pending but still within the throttle window: keep
             // repainting so the debounce timer actually elapses instead of
-            // waiting for unrelated input to trigger the next frame. Note
-            // this fires for an `Unsaved` tab too (its `is_dirty()` is true
-            // the moment any field diverges from `None`) — a known quirk
-            // carried over unchanged from before tabs existed (see Phase 1's
-            // notes on why `egui_kittest` tests use `.step()` not `.run()`).
+            // waiting for unrelated input to trigger the next frame.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -7078,6 +7091,55 @@ mod tests {
         assert!(summary.starts_with("Imported 8/10 files; 2 failed:"));
         assert!(summary.contains("- /tmp/broken.json: import failed: unexpected EOF"));
         assert!(summary.contains("- /tmp/missing.json: Could not read file: not found"));
+    }
+
+    /// Real, measured bug this guards against: a brand-new `App` always
+    /// starts with exactly one `Unsaved`-origin tab, whose `is_dirty()` is
+    /// permanently `true` (there's nowhere to autosave it to, so it never
+    /// gets a synced snapshot to compare against). `has_savable_dirty_tab`
+    /// must say `false` for that case — otherwise `fn ui` keeps requesting
+    /// a repaint every ~100ms for the entire lifetime of the app, which a
+    /// real `ps`/`vmmap` measurement showed costs ~20-24% CPU at true idle
+    /// and prevents the GPU/graphics memory footprint from ever settling
+    /// back down (~170MB+ vs. ~5MB once fixed) — confirmed empirically, not
+    /// just reasoned about.
+    #[test]
+    fn has_savable_dirty_tab_ignores_the_permanently_dirty_unsaved_tab() {
+        let app = App::with_data(AppData::default());
+        assert!(matches!(app.active_tab().origin, RequestOrigin::Unsaved));
+        assert!(
+            app.active_tab().is_dirty(),
+            "an Unsaved tab is permanently dirty by design"
+        );
+        assert!(
+            !app.has_savable_dirty_tab(),
+            "but that should never count as a reason to keep repainting"
+        );
+    }
+
+    /// A genuinely dirty, collection-backed tab *should* count — this is
+    /// the real case the repaint-for-debounce logic exists for.
+    #[test]
+    fn has_savable_dirty_tab_is_true_for_a_dirty_collection_backed_tab() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        let req = RequestItem::new("Get Users");
+        let collection_id = collection.id;
+        collection.requests.push(req.clone());
+        data.collections.push(collection);
+
+        let mut app = App::with_data(data);
+        app.open_request_in_tab(collection_id, Vec::new(), req);
+        assert!(
+            !app.has_savable_dirty_tab(),
+            "freshly opened, not yet edited"
+        );
+
+        app.active_tab_mut().current_request.name = "Get Users (edited)".to_string();
+        assert!(
+            app.has_savable_dirty_tab(),
+            "an edited collection-backed tab has a real debounce timer worth waiting out"
+        );
     }
 
     /// Pure test for `jump_tab_history`'s walk/skip-stale logic, no `egui::Ui`

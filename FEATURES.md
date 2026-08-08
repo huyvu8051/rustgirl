@@ -368,3 +368,16 @@ AeroSpace, command palette leader-key, tab Console ✅
   tự cuộn để luôn thấy dòng đang chọn, nhưng chỉ cuộn đúng lúc vừa bấm
   Ctrl+N/P (không cuộn liên tục mỗi frame) để không phá việc tự cuộn tay
   bằng chuột.
+- **Sửa lỗi thật khiến app tốn RAM/CPU dù không làm gì cả** — điều tra kỹ
+  bằng công cụ đo chính xác (`vmmap`, đúng số Activity Monitor hiển thị),
+  dựng cả 1 app egui tối giản để so sánh, phát hiện: app cũ **không bao
+  giờ thật sự "rảnh"** — nó tự vẽ lại liên tục mỗi ~100ms **vĩnh viễn** chỉ
+  vì tab "chưa lưu" mặc định (tab trắng lúc mới mở app) luôn bị coi là
+  "chưa lưu xong", trong khi thật ra tab đó chẳng bao giờ có chỗ để lưu
+  vào cả. Vì cứ vẽ lại liên tục nên GPU buffer không bao giờ được macOS
+  thu hồi lại. Sửa xong, đo lại thật (build release, dữ liệu thật):
+  - CPU lúc rảnh: ~20-24% → **0%**
+  - RAM thật (Physical footprint): ~250MB → **~78MB** (giảm ~70%!)
+  - Vụ đổi renderer wgpu→glow trước đó (không giúp được gì thật sự, đo lại
+    kỹ hơn thấy chênh chưa tới 2%) đã được **revert** — đây mới là fix
+    thật sự đáng kể.
