@@ -362,3 +362,9 @@ AeroSpace, command palette leader-key, tab Console ✅
   quay về đúng nghĩa "tìm request" (search files) thay vì trộn chung với
   danh sách lệnh, kể cả khi từ khóa gõ vào tình cờ khớp cả tên 1 request
   lẫn 1 lệnh nào đó.
+- **Sửa lỗi Ctrl+N/P không tự cuộn trong ô tìm kiếm** — trước đây bấm
+  Ctrl+N nhiều lần, ô được chọn cứ trôi xuống dưới mà danh sách không tự
+  cuộn theo, nên chọn ra ngoài màn hình lúc nào không biết. Giờ danh sách
+  tự cuộn để luôn thấy dòng đang chọn, nhưng chỉ cuộn đúng lúc vừa bấm
+  Ctrl+N/P (không cuộn liên tục mỗi frame) để không phá việc tự cuộn tay
+  bằng chuột.

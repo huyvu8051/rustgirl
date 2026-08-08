@@ -2579,6 +2579,13 @@ impl App {
                     response.request_focus();
                     self.search_needs_focus = false;
                 }
+                // Tracks whether `palette_selected` actually moved this
+                // frame (typing a new query resets it to the top; Ctrl+N/P
+                // below can also change it) — the scroll area only snaps
+                // the selected row into view on a frame where this is true,
+                // not unconditionally every frame, so it doesn't fight a
+                // manual mouse-wheel scroll through the list.
+                let mut selection_moved = response.changed();
                 if response.changed() {
                     self.palette_selected = 0;
                 }
@@ -2662,10 +2669,12 @@ impl App {
                 if !entries.is_empty() {
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
                         self.palette_selected = (self.palette_selected + 1) % entries.len();
+                        selection_moved = true;
                     }
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
                         self.palette_selected =
                             (self.palette_selected + entries.len() - 1) % entries.len();
+                        selection_moved = true;
                     }
                 }
                 self.palette_selected = self.palette_selected.min(entries.len().saturating_sub(1));
@@ -2719,6 +2728,17 @@ impl App {
                                 });
                             if row.response.interact(egui::Sense::click()).clicked() {
                                 selected = Some(entry.clone());
+                            }
+                            // Real, reported bug: Ctrl+N/P moved the
+                            // highlight but never scrolled the list, so
+                            // once the selection went past the visible
+                            // rows it kept moving invisibly off-screen.
+                            // Only snaps into view on the frame the
+                            // selection actually changed (see
+                            // `selection_moved`'s own comment) so it
+                            // doesn't fight a manual mouse-wheel scroll.
+                            if i == self.palette_selected && selection_moved {
+                                row.response.scroll_to_me(Some(egui::Align::Center));
                             }
                         }
                     });
@@ -8394,6 +8414,44 @@ mod tests {
             harness.state().palette_selected > 0,
             "Ctrl+P from the first entry should wrap around to the last one"
         );
+    }
+
+    /// Real, reported bug: Ctrl+N/P moved the highlight but never scrolled
+    /// the list, so once there were more entries than fit in the palette's
+    /// fixed-height scroll area, the selection kept moving invisibly off-
+    /// screen. Enough requests to overflow that height, then Ctrl+N well
+    /// past the fold — reviewed as a snapshot (not a structural assertion:
+    /// `egui::ScrollArea::show` lays out every row regardless of scroll
+    /// position, so a plain "is this row's label queryable" check would
+    /// pass whether or not the fix actually works — this is a genuinely
+    /// visual concern).
+    #[test]
+    #[ignore]
+    fn ctrl_n_scrolls_the_palette_to_keep_the_selection_visible() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        for i in 0..30 {
+            collection
+                .requests
+                .push(RequestItem::new(format!("Request {i:02}")));
+        }
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.state_mut().search_open = true;
+        harness.step();
+        harness.step();
+
+        for _ in 0..25 {
+            harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+            harness.step();
+        }
+        assert_eq!(harness.state().palette_selected, 25);
+        harness.snapshot("phase17_palette_scroll_follows_selection");
     }
 
     /// The first explicit light-theme baseline in this project — every
