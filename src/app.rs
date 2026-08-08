@@ -2838,84 +2838,96 @@ impl App {
         // row.
         let hotkeys_by_request = model::reverse_hotkey_bindings(&self.data.hotkey_bindings);
 
-        egui::ScrollArea::horizontal()
-            .id_salt("tab_bar_scroll")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (idx, tab) in self.tabs.iter().enumerate() {
-                        let drag_id = egui::Id::new(("open_tab", idx));
-                        // The active tab's chip gets an accent-colored border —
-                        // egui's `Frame` strokes the whole rectangle rather
-                        // than one edge, so this approximates Postman's own
-                        // colored active-tab underline as a full outline
-                        // instead of a broken attempt at a partial one.
-                        let mut chip_frame = egui::Frame::group(ui.style());
-                        if idx == self.active_tab {
-                            chip_frame = chip_frame.stroke(egui::Stroke::new(1.5, theme::ACCENT));
-                        }
-                        let (zone, dropped) = ui.dnd_drop_zone::<usize, _>(chip_frame, |ui| {
-                            ui.horizontal(|ui| {
-                                // A dedicated drag handle, separate from the
-                                // selectable label/close button below: wrapping
-                                // the *whole* chip in `dnd_drag_source` (as this
-                                // did originally) intercepts plain clicks — its
-                                // own `Sense::drag()` interact sits on top of
-                                // the label's `Sense::click()` and swallows the
-                                // click before it reaches it, so a tab could
-                                // never be selected. Same bug, same fix, as the
-                                // collection-tree rows in Phase 3.
-                                ui.dnd_drag_source(drag_id, idx, |ui| {
-                                    ui.weak("::");
+        // egui's default scroll style is "floating" — the bar only reserves
+        // space while actively being dragged, and otherwise overlaps the
+        // content on hover (reported: hovering the scrollbar covered the
+        // tab chips underneath it). Scoped to just this scroll area, not a
+        // global style change, since only the tab bar was reported.
+        ui.scope(|ui| {
+            ui.spacing_mut().scroll.floating = false;
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_bar_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (idx, tab) in self.tabs.iter().enumerate() {
+                            let drag_id = egui::Id::new(("open_tab", idx));
+                            // The active tab's chip gets an accent-colored border —
+                            // egui's `Frame` strokes the whole rectangle rather
+                            // than one edge, so this approximates Postman's own
+                            // colored active-tab underline as a full outline
+                            // instead of a broken attempt at a partial one.
+                            let mut chip_frame = egui::Frame::group(ui.style());
+                            if idx == self.active_tab {
+                                chip_frame =
+                                    chip_frame.stroke(egui::Stroke::new(1.5, theme::ACCENT));
+                            }
+                            let (zone, dropped) = ui.dnd_drop_zone::<usize, _>(chip_frame, |ui| {
+                                ui.horizontal(|ui| {
+                                    // A dedicated drag handle, separate from the
+                                    // selectable label/close button below: wrapping
+                                    // the *whole* chip in `dnd_drag_source` (as this
+                                    // did originally) intercepts plain clicks — its
+                                    // own `Sense::drag()` interact sits on top of
+                                    // the label's `Sense::click()` and swallows the
+                                    // click before it reaches it, so a tab could
+                                    // never be selected. Same bug, same fix, as the
+                                    // collection-tree rows in Phase 3.
+                                    ui.dnd_drag_source(drag_id, idx, |ui| {
+                                        ui.weak("::");
+                                    });
+                                    let method_text = tab.current_request.method.as_str();
+                                    let color = theme::method_color(tab.current_request.method);
+                                    ui.colored_label(color, method_text);
+                                    let name = if tab.current_request.name.is_empty() {
+                                        "Untitled Request"
+                                    } else {
+                                        tab.current_request.name.as_str()
+                                    };
+                                    let selected =
+                                        ui.selectable_label(idx == self.active_tab, name).clicked();
+                                    if let Some(key) =
+                                        hotkeys_by_request.get(&tab.current_request.id)
+                                    {
+                                        ui.weak(format!("[{key}]"));
+                                    }
+                                    if tab.is_dirty() {
+                                        // Plain ASCII "*" rather than "●"
+                                        // (U+25CF): egui's bundled font doesn't
+                                        // cover it, rendering as an empty tofu
+                                        // box — same class of missing-glyph
+                                        // issue hit (and fixed the same way) in
+                                        // Phases 2, 3, and 7.
+                                        ui.weak("*");
+                                    }
+                                    if ui.small_button("\u{d7}").clicked() {
+                                        close_idx = Some(idx);
+                                    }
+                                    if selected {
+                                        select_idx = Some(idx);
+                                    }
                                 });
-                                let method_text = tab.current_request.method.as_str();
-                                let color = theme::method_color(tab.current_request.method);
-                                ui.colored_label(color, method_text);
-                                let name = if tab.current_request.name.is_empty() {
-                                    "Untitled Request"
-                                } else {
-                                    tab.current_request.name.as_str()
-                                };
-                                let selected =
-                                    ui.selectable_label(idx == self.active_tab, name).clicked();
-                                if let Some(key) = hotkeys_by_request.get(&tab.current_request.id) {
-                                    ui.weak(format!("[{key}]"));
-                                }
-                                if tab.is_dirty() {
-                                    // Plain ASCII "*" rather than "●"
-                                    // (U+25CF): egui's bundled font doesn't
-                                    // cover it, rendering as an empty tofu
-                                    // box — same class of missing-glyph
-                                    // issue hit (and fixed the same way) in
-                                    // Phases 2, 3, and 7.
-                                    ui.weak("*");
-                                }
-                                if ui.small_button("\u{d7}").clicked() {
-                                    close_idx = Some(idx);
-                                }
-                                if selected {
-                                    select_idx = Some(idx);
-                                }
                             });
-                        });
-                        if let Some(dropped) = dropped {
-                            reorder = Some((*dropped, idx));
+                            if let Some(dropped) = dropped {
+                                reorder = Some((*dropped, idx));
+                            }
+                            // Only scroll on the frame the active tab actually
+                            // changed (not every frame) — otherwise this would
+                            // fight a manual horizontal scroll through the bar.
+                            if idx == self.active_tab && self.active_tab != self.tab_bar_scrolled_to
+                            {
+                                zone.response.scroll_to_me(Some(egui::Align::Center));
+                            }
                         }
-                        // Only scroll on the frame the active tab actually
-                        // changed (not every frame) — otherwise this would
-                        // fight a manual horizontal scroll through the bar.
-                        if idx == self.active_tab && self.active_tab != self.tab_bar_scrolled_to {
-                            zone.response.scroll_to_me(Some(egui::Align::Center));
+                        if ui
+                            .button("+")
+                            .on_hover_text("New tab (Cmd/Ctrl+T)")
+                            .clicked()
+                        {
+                            self.new_blank_tab();
                         }
-                    }
-                    if ui
-                        .button("+")
-                        .on_hover_text("New tab (Cmd/Ctrl+T)")
-                        .clicked()
-                    {
-                        self.new_blank_tab();
-                    }
+                    });
                 });
-            });
+        });
 
         if let Some(idx) = select_idx {
             self.active_tab = idx;
