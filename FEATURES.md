@@ -325,3 +325,32 @@ AeroSpace, command palette leader-key, tab Console ✅
   chiều cao, và có nút "×" để tắt hẳn đi thay vì cứ nằm lì mãi.
 - **133 unit test** (từ 130) — thêm test cho các mức màu status/method, và
   test cho logic gộp thông báo import hàng loạt.
+
+## Phase 17 follow-up — icon cây thư mục, chuột phải, phím tắt bằng bàn phím ✅
+- **Icon mở/đóng thật** thay cho chữ "v"/">" — vẽ tam giác thật bằng chính
+  hàm vẽ nội bộ của egui, không phải font glyph, nên không bao giờ bị lỗi
+  ô vuông trống (tofu box) như các icon Unicode từng gặp trước đây.
+- **Nút "+" thêm request** hiện lại trên mỗi dòng collection/folder — bị
+  mất từ đợt viết lại cây ảo hóa, giờ có lại cùng lúc với menu chuột phải.
+- **Sửa lỗi chuột phải không có tác dụng gì cả** — đây là lỗi thật, có từ
+  rất lâu (không phải do vừa làm hỏng): egui coi vùng kéo-thả (drop zone)
+  của mỗi dòng chỉ "cảm nhận" hover, không cảm nhận click, nên chuột phải
+  không bao giờ được ghi nhận. Lần sửa đầu tiên (ép vùng đó cảm nhận click)
+  lại gây ra lỗi mới — nó tranh mất click với icon mở/đóng và nút tên bên
+  trong, làm hỏng luôn cả việc mở/đóng cây (phát hiện ngay vì 1 test cũ tự
+  nhiên fail, không phải đoán). Sửa đúng cách: đọc thẳng trạng thái chuột
+  phải thay vì đăng ký thêm 1 widget cảm nhận click chồng lên — không còn
+  tranh chấp. Có test giả lập chuột phải thật để đảm bảo không tái diễn.
+- **`space` → `a` → `h`**: gán phím tắt cho request đang mở (tab đang active)
+  ngay bằng bàn phím, không cần chuột phải — banner màu vàng ở trên giờ ghi
+  rõ tên request đang được gán ("...cho "Get Users"...") thay vì chữ chung
+  chung.
+- **`space` → `s` → `e`**: mở nhanh command palette, tự lọc sẵn theo
+  "Environment:" để chọn environment ngay bằng bàn phím.
+- **Badge phím tắt trên tab đang mở**: tab nào có request đã gán phím tắt
+  thì hiện luôn "[phím]" ngay trên chip của tab đó, giống hệt badge đã có
+  trong sidebar — trước đây chỉ thấy trong sidebar, mở request ra thì mất.
+- Thêm 6 test tương tác thật (`egui_kittest`, chạy bằng `cargo test --
+  --ignored` vì cần GPU): click chuột phải thật để xác nhận menu context
+  mở đúng, gõ phím leader-chord thật cho cả 2 tổ hợp mới, và snapshot cho
+  banner gán phím tắt + badge phím tắt trên tab.

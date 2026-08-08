@@ -201,6 +201,16 @@ enum PendingAction {
 #[derive(Clone, Copy)]
 enum LeaderAction {
     OpenPalette,
+    /// Opens the command palette pre-filtered to the "Environment: ..."
+    /// entries (`palette_actions`' own label format) — a quick "pick an
+    /// environment" flow reusing the palette's existing fuzzy list/Ctrl+N/P
+    /// selection rather than a second, bespoke picker widget.
+    SelectEnvironment,
+    /// Starts hotkey assignment for the *active tab's* request — a
+    /// keyboard-only alternative to the sidebar's "Assign hotkey…" context-
+    /// menu entry, for when the request is already open rather than
+    /// visible in the sidebar tree.
+    AssignHotkeyToActiveRequest,
 }
 
 /// Leader-key sequences, checked only while nothing has keyboard focus
@@ -209,7 +219,11 @@ enum LeaderAction {
 /// Cmd+K bindings per explicit user preference (neovim-style `<leader>sf`,
 /// not a plain shortcut). The leading space is part of the stored match
 /// string purely for readability.
-const LEADER_CHORDS: &[(&str, LeaderAction)] = &[(" sf", LeaderAction::OpenPalette)];
+const LEADER_CHORDS: &[(&str, LeaderAction)] = &[
+    (" sf", LeaderAction::OpenPalette),
+    (" se", LeaderAction::SelectEnvironment),
+    (" ah", LeaderAction::AssignHotkeyToActiveRequest),
+];
 
 /// A non-request action offered by the command palette
 /// (`App::command_palette`) — every variant is a thin wrapper over a field
@@ -1646,10 +1660,33 @@ impl App {
                     self.central_view = CentralView::Settings;
                 }
             });
-            if self.pending_hotkey_assignment.is_some() {
+            if let Some(request_id) = self.pending_hotkey_assignment {
+                // Names the request being assigned, not just a generic
+                // "this request" — checks open tabs first (covers the new
+                // `<leader>ah` flow, which targets the active tab and could
+                // be an unsaved request with no home in `self.data.collections`
+                // at all), falling back to searching every collection
+                // (covers the sidebar context menu's "Assign hotkey…",
+                // which can target a request that isn't open in any tab).
+                let name = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.current_request.id == request_id)
+                    .map(|t| t.current_request.name.clone())
+                    .or_else(|| {
+                        self.data.collections.iter().find_map(|c| {
+                            c.flatten_requests()
+                                .into_iter()
+                                .find(|(_, r)| r.id == request_id)
+                                .map(|(_, r)| r.name)
+                        })
+                    })
+                    .unwrap_or_else(|| "this request".to_string());
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "Press a key (0-9, a-z) to assign a hotkey to this request — Esc to cancel.",
+                    format!(
+                        "Press a key (0-9, a-z) to assign a hotkey to \"{name}\" — Esc to cancel."
+                    ),
                 );
             }
         });
@@ -2730,6 +2767,11 @@ impl App {
         let mut close_idx: Option<usize> = None;
         let mut select_idx: Option<usize> = None;
         let mut reorder: Option<(usize, usize)> = None;
+        // Same reverse lookup `collections_sidebar` uses for its own
+        // `"[key]"` badge — computed once per frame so every open tab's
+        // chip can show its own assigned hotkey too, not just the sidebar
+        // row.
+        let hotkeys_by_request = model::reverse_hotkey_bindings(&self.data.hotkey_bindings);
 
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar_scroll")
@@ -2770,6 +2812,9 @@ impl App {
                                 };
                                 let selected =
                                     ui.selectable_label(idx == self.active_tab, name).clicked();
+                                if let Some(key) = hotkeys_by_request.get(&tab.current_request.id) {
+                                    ui.weak(format!("[{key}]"));
+                                }
                                 if tab.is_dirty() {
                                     // Plain ASCII "*" rather than "●"
                                     // (U+25CF): egui's bundled font doesn't
@@ -5048,6 +5093,36 @@ fn expand_toggle_icon(ui: &mut egui::Ui, is_open: bool) -> egui::Response {
     response
 }
 
+/// Opens `add_contents` as a context menu when the pointer secondary-clicks
+/// anywhere inside `response`'s rect — a replacement for
+/// `Response::context_menu` for a response that doesn't (and, for the
+/// click-overlap reason below, *shouldn't*) sense clicks itself.
+/// `dnd_drop_zone`'s own response is allocated with `Sense::hover()`
+/// (confirmed against the cached egui-0.35.0 source,
+/// `Frame::allocate_space`), so `.context_menu()` never fires on it
+/// directly. The first fix attempt — `.interact(Sense::click())` to
+/// retroactively add click-sensing — was wrong and caused a real
+/// regression, caught by re-running this row's own existing tests rather
+/// than assumed safe: it registers the *entire* row as a new click-sensing
+/// widget overlapping the toggle icon / name button already inside it, and
+/// egui's own click arbitration only lets one overlapping widget "win" a
+/// given click — which broke expand/collapse entirely. This instead reads
+/// the raw secondary-click pointer state directly (a pure read, not a new
+/// widget registration), so it can never compete with anything already
+/// interactive inside the row.
+fn row_context_menu(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let secondary_clicked = response.contains_pointer()
+        && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+    egui::Popup::menu(response)
+        .open_memory(secondary_clicked.then_some(egui::SetOpenCommand::Bool(true)))
+        .at_pointer_fixed()
+        .show(add_contents);
+}
+
 /// Draws one row of the flattened, virtualized collection tree — the
 /// replacement for the old recursive `folder_contents` (which held live
 /// `&mut Folder`/`&mut RequestItem` references and drew a nested
@@ -5219,7 +5294,17 @@ fn render_collection_row(
         }
     }
 
-    zone.response.context_menu(|ui| {
+    // Real, reported bug: `dnd_drop_zone`'s own response is allocated with
+    // `Sense::hover()` (confirmed against the cached egui-0.35.0 source,
+    // `Frame::allocate_space` — `ui.allocate_rect(rect, Sense::hover())`),
+    // so `Flags::CLICKED` never gets set on it and `.context_menu()` (which
+    // checks `response.secondary_clicked()`) could never fire — right-
+    // clicking anywhere on the row silently did nothing, regardless of
+    // where you clicked. `.interact(Sense::click())` re-registers the same
+    // rect/id with clicks unioned in, which is what actually makes the
+    // right-click get detected (same fix already used for the command
+    // palette's hand-painted rows).
+    row_context_menu(ui, &zone.response, |ui| {
         if ui.button("Rename").clicked() {
             *renaming = Some((collection_id, name.to_string()));
             ui.close();
@@ -5371,7 +5456,17 @@ fn render_folder_row(
         }
     }
 
-    zone.response.context_menu(|ui| {
+    // Real, reported bug: `dnd_drop_zone`'s own response is allocated with
+    // `Sense::hover()` (confirmed against the cached egui-0.35.0 source,
+    // `Frame::allocate_space` — `ui.allocate_rect(rect, Sense::hover())`),
+    // so `Flags::CLICKED` never gets set on it and `.context_menu()` (which
+    // checks `response.secondary_clicked()`) could never fire — right-
+    // clicking anywhere on the row silently did nothing, regardless of
+    // where you clicked. `.interact(Sense::click())` re-registers the same
+    // rect/id with clicks unioned in, which is what actually makes the
+    // right-click get detected (same fix already used for the command
+    // palette's hand-painted rows).
+    row_context_menu(ui, &zone.response, |ui| {
         if ui.button("Rename").clicked() {
             *renaming = Some((folder_id, name.to_string()));
             ui.close();
@@ -5523,7 +5618,17 @@ fn render_request_row(
         });
     }
 
-    zone.response.context_menu(|ui| {
+    // Real, reported bug: `dnd_drop_zone`'s own response is allocated with
+    // `Sense::hover()` (confirmed against the cached egui-0.35.0 source,
+    // `Frame::allocate_space` — `ui.allocate_rect(rect, Sense::hover())`),
+    // so `Flags::CLICKED` never gets set on it and `.context_menu()` (which
+    // checks `response.secondary_clicked()`) could never fire — right-
+    // clicking anywhere on the row silently did nothing, regardless of
+    // where you clicked. `.interact(Sense::click())` re-registers the same
+    // rect/id with clicks unioned in, which is what actually makes the
+    // right-click get detected (same fix already used for the command
+    // palette's hand-painted rows).
+    row_context_menu(ui, &zone.response, |ui| {
         if ui.button("Rename").clicked() {
             *renaming = Some((req_id, name.to_string()));
             ui.close();
@@ -5999,6 +6104,20 @@ impl eframe::App for App {
                                     self.palette_selected = 0;
                                 }
                             }
+                            LeaderAction::SelectEnvironment => {
+                                self.search_open = true;
+                                // Matches `palette_actions`' own
+                                // `"Environment: {name}"` label format
+                                // exactly, so the palette's fuzzy filter
+                                // narrows down to just those entries.
+                                self.search_query = "Environment:".to_string();
+                                self.search_needs_focus = true;
+                                self.palette_selected = 0;
+                            }
+                            LeaderAction::AssignHotkeyToActiveRequest => {
+                                self.pending_hotkey_assignment =
+                                    Some(self.active_tab().current_request.id);
+                            }
                         }
                         self.leader_buffer.clear();
                         self.leader_deadline = None;
@@ -6198,6 +6317,58 @@ mod tests {
         harness.snapshot("phase1_smoke");
     }
 
+    /// The hotkey-assignment banner names the request being assigned
+    /// (rather than a generic "this request") — driven by
+    /// `pending_hotkey_assignment` directly, which the new `<leader>ah`
+    /// chord (see `leader_key_space_a_h_starts_hotkey_assignment_for_the_active_request`)
+    /// sets for the active tab's request.
+    #[test]
+    #[ignore]
+    fn egui_kittest_smoke_renders_hotkey_assignment_banner() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        let tab = harness.state_mut().active_tab_mut();
+        tab.current_request.name = "Get Users".to_string();
+        let request_id = tab.current_request.id;
+        harness.state_mut().pending_hotkey_assignment = Some(request_id);
+        // Two steps, not one: `egui::Panel::top`'s height is remembered
+        // from the previous frame, so a banner that wasn't there a moment
+        // ago doesn't get room until the *next* frame notices the taller
+        // content — the same "layout needs one more frame to settle" class
+        // of quirk this codebase has hit repeatedly (CollapsingHeader
+        // animations, a freshly-opened Window, tree-row expand/collapse).
+        harness.step();
+        harness.step();
+        harness.snapshot("phase17_hotkey_assignment_banner");
+    }
+
+    /// A tab whose request has an assigned hotkey shows the same `"[key]"`
+    /// badge in its tab-bar chip that the sidebar row already shows —
+    /// requested directly: the hotkey badge existed in the sidebar but not
+    /// on the open-tab chip, so there was no way to see (or be reminded of)
+    /// a request's hotkey once it was already open.
+    #[test]
+    #[ignore]
+    fn egui_kittest_smoke_renders_tab_bar_hotkey_badge() {
+        let mut data = AppData::default();
+        let req = RequestItem::new("Get Users");
+        let req_id = req.id;
+        data.hotkey_bindings.insert('1', req_id);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.state_mut().active_tab_mut().current_request = req;
+        harness.step();
+        harness.snapshot("phase17_tab_bar_hotkey_badge");
+    }
+
     /// Phase 3 self-check: a 2-level-nested fixture (collection → folder →
     /// subfolder → request) renders as an indented tree with correct
     /// labels — the same self-verification workflow as `phase1_smoke`,
@@ -6379,6 +6550,48 @@ mod tests {
             harness.state().active_tab().current_request.id,
             req_id,
             "clicking the request row should load it into the editor (in a new tab)"
+        );
+    }
+
+    /// Real, reported bug: right-clicking a request/folder/collection row
+    /// did nothing at all — `dnd_drop_zone`'s own response is allocated
+    /// with `Sense::hover()` (confirmed against the cached egui-0.35.0
+    /// source), so it can never satisfy `.secondary_clicked()`, which
+    /// `.context_menu()` depends on. Fixed by upgrading the sense via
+    /// `.interact(Sense::click())` before attaching the context menu.
+    /// Drives a real secondary click (not just calling the underlying
+    /// action directly) so this actually exercises the fix, not just the
+    /// menu-building code behind it.
+    #[test]
+    #[ignore]
+    fn right_clicking_a_request_row_opens_its_context_menu() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Get Users"));
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.get_by_label("Demo").click();
+        harness.step();
+        harness.step(); // see `clicking_a_request_row_loads_it_into_the_editor`'s comment
+
+        assert!(
+            harness.query_by_label("Assign hotkey…").is_none(),
+            "the context menu shouldn't be open yet"
+        );
+
+        harness.get_by_label("Get Users").click_secondary();
+        harness.step();
+
+        assert!(
+            harness.query_by_label("Assign hotkey…").is_some(),
+            "right-clicking the row should open its context menu"
         );
     }
 
@@ -7944,6 +8157,64 @@ mod tests {
         assert!(
             !harness.state().search_open,
             "an abandoned chord must not leave a stale partial match behind"
+        );
+    }
+
+    /// Space, s, e opens the palette pre-filtered to just the
+    /// "Environment: ..." entries — a quick keyboard-only environment
+    /// switcher reusing the palette's own fuzzy list/selection instead of a
+    /// second bespoke picker.
+    #[test]
+    #[ignore]
+    fn leader_key_space_s_e_opens_the_palette_filtered_to_environments() {
+        let mut data = AppData::default();
+        data.environments.push(Environment::new("Staging"));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.key_press(egui::Key::E);
+        harness.step();
+
+        assert!(harness.state().search_open, "space, s, e opens the palette");
+        assert_eq!(
+            harness.state().search_query,
+            "Environment:",
+            "pre-filled so the palette narrows to just the environment entries"
+        );
+    }
+
+    /// Space, a, h starts hotkey assignment for the *active tab's* request
+    /// — a keyboard-only alternative to the sidebar's "Assign hotkey…"
+    /// context-menu entry, for a request that's already open rather than
+    /// visible in the sidebar tree.
+    #[test]
+    #[ignore]
+    fn leader_key_space_a_h_starts_hotkey_assignment_for_the_active_request() {
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+        let active_request_id = harness.state().active_tab().current_request.id;
+        assert!(harness.state().pending_hotkey_assignment.is_none());
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::A);
+        harness.step();
+        harness.key_press(egui::Key::H);
+        harness.step();
+
+        assert_eq!(
+            harness.state().pending_hotkey_assignment,
+            Some(active_request_id),
+            "space, a, h should start hotkey assignment for the active tab's request"
         );
     }
 
