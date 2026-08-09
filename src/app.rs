@@ -200,12 +200,16 @@ enum PendingAction {
 /// entry, not new plumbing.
 #[derive(Clone, Copy)]
 enum LeaderAction {
+    /// Requests-only ("search files").
     OpenPalette,
     /// Opens the command palette pre-filtered to the "Environment: ..."
     /// entries (`palette_actions`' own label format) — a quick "pick an
     /// environment" flow reusing the palette's existing fuzzy list/Ctrl+N/P
     /// selection rather than a second, bespoke picker widget.
     SelectEnvironment,
+    /// Commands-only, no requests — the counterpart to `OpenPalette`'s
+    /// requests-only view, for jumping straight to an action by name.
+    OpenCommandPalette,
     /// Starts hotkey assignment for the *active tab's* request — a
     /// keyboard-only alternative to the sidebar's "Assign hotkey…" context-
     /// menu entry, for when the request is already open rather than
@@ -221,13 +225,30 @@ enum LeaderAction {
 /// the command palette's *only* trigger now, replacing the old Alt+Space/
 /// Cmd+K bindings per explicit user preference (neovim-style `<leader>sf`,
 /// not a plain shortcut). The leading space is part of the stored match
-/// string purely for readability.
-const LEADER_CHORDS: &[(&str, LeaderAction)] = &[
-    (" sf", LeaderAction::OpenPalette),
-    (" se", LeaderAction::SelectEnvironment),
-    (" ah", LeaderAction::AssignHotkeyToActiveRequest),
-    (" us", LeaderAction::ToggleSidebar),
+/// string purely for readability. The third element is a short
+/// human-readable label shown by the which-key-style hint popup
+/// (`leader_which_key_hint`) while a chord is in progress.
+const LEADER_CHORDS: &[(&str, LeaderAction, &str)] = &[
+    (" sf", LeaderAction::OpenPalette, "Search requests"),
+    (" se", LeaderAction::SelectEnvironment, "Select environment"),
+    (" sc", LeaderAction::OpenCommandPalette, "Search commands"),
+    (
+        " ah",
+        LeaderAction::AssignHotkeyToActiveRequest,
+        "Assign hotkey to active request",
+    ),
+    (" us", LeaderAction::ToggleSidebar, "Toggle sidebar"),
 ];
+
+/// What the command palette's own list is narrowed to — set by which
+/// leader chord opened it (see `LeaderAction`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum PaletteScope {
+    #[default]
+    Combined,
+    RequestsOnly,
+    CommandsOnly,
+}
 
 /// A non-request action offered by the command palette
 /// (`App::command_palette`) — every variant is a thin wrapper over a field
@@ -566,13 +587,11 @@ pub struct App {
     search_open: bool,
     search_query: String,
     search_needs_focus: bool,
-    /// `<leader>sf` ("search files", i.e. requests) opens the palette
-    /// showing *only* request entries — no `PaletteAction`s at all — unlike
-    /// `<leader>se`'s combined-but-query-filtered palette. A separate flag
-    /// rather than a third palette-mode enum, since every other chord that
-    /// opens this same window wants the full action+request list, just
-    /// pre-filtered by its own query text.
-    palette_requests_only: bool,
+    /// `<leader>sf` ("search files", i.e. requests) shows *only* request
+    /// entries; `<leader>sc` shows *only* `PaletteAction`s; every other
+    /// chord that opens this same window (`<leader>se`) wants the combined
+    /// list, just pre-filtered by its own query text.
+    palette_scope: PaletteScope,
     /// Which entry in the command palette's filtered list is highlighted —
     /// `Ctrl+N`/`Ctrl+P` (Emacs-style) move it, Enter picks whichever one
     /// this points at. Reset to `0` whenever the palette opens or the
@@ -719,7 +738,7 @@ impl App {
             search_open: false,
             search_query: String::new(),
             search_needs_focus: false,
-            palette_requests_only: false,
+            palette_scope: PaletteScope::default(),
             palette_selected: 0,
             fuzzy_matcher: nucleo_matcher::Matcher::default(),
             last_screen_size: None,
@@ -749,6 +768,39 @@ impl App {
     fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.sidebar_auto_hidden = false;
+    }
+
+    /// A neovim `which-key`-style hint: while a leader-key chord is in
+    /// progress (`leader_buffer` non-empty), shows every `LEADER_CHORDS`
+    /// entry that still matches what's been typed so far, each with its
+    /// remaining key(s) and short label — so the available chords don't
+    /// have to be memorized. Disappears the same frame the chord resolves
+    /// or aborts, since that's exactly when `leader_buffer` clears.
+    fn leader_which_key_hint(&self, ctx: &egui::Context) {
+        if self.leader_buffer.is_empty() {
+            return;
+        }
+        let candidates: Vec<(&'static str, &'static str)> = LEADER_CHORDS
+            .iter()
+            .filter(|(seq, _, _)| seq.starts_with(self.leader_buffer.as_str()))
+            .map(|(seq, _, label)| (&seq[self.leader_buffer.len()..], *label))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::new("leader_which_key_hint"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    for (keys, label) in &candidates {
+                        ui.horizontal(|ui| {
+                            ui.strong(*keys);
+                            ui.label(*label);
+                        });
+                    }
+                });
+            });
     }
 
     fn save(&self) {
@@ -2639,10 +2691,10 @@ impl App {
         let mut selected: Option<PaletteEntry> = None;
         let mut close = false;
 
-        let title = if self.palette_requests_only {
-            "Search Requests"
-        } else {
-            "Search Requests & Commands"
+        let title = match self.palette_scope {
+            PaletteScope::RequestsOnly => "Search Requests",
+            PaletteScope::CommandsOnly => "Search Commands",
+            PaletteScope::Combined => "Search Requests & Commands",
         };
         egui::Window::new(title)
             .id(egui::Id::new("search_palette_window"))
@@ -2652,10 +2704,10 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
             .default_width(520.0)
             .show(ctx, |ui| {
-                let hint = if self.palette_requests_only {
-                    "Search requests\u{2026}"
-                } else {
-                    "Search requests or type a command\u{2026}"
+                let hint = match self.palette_scope {
+                    PaletteScope::RequestsOnly => "Search requests\u{2026}",
+                    PaletteScope::CommandsOnly => "Search commands\u{2026}",
+                    PaletteScope::Combined => "Search requests or type a command\u{2026}",
                 };
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
@@ -2692,58 +2744,62 @@ impl App {
                 // score tied at 0) preserves today's original insertion
                 // order, so "show everything, unranked" looks the same as
                 // before; only an actual query reorders anything.
-                // `<leader>sf` ("search files", i.e. requests) shows no
-                // commands at all — `palette_requests_only` skips scoring
-                // the action list entirely rather than scoring-then-hiding
-                // it, so it can never leak in via a lucky fuzzy match.
-                let mut scored: Vec<(u32, PaletteEntry)> = if self.palette_requests_only {
-                    Vec::new()
-                } else {
-                    self.palette_actions()
-                        .into_iter()
-                        .filter_map(|(label, action)| {
-                            let score = fuzzy_score(&mut self.fuzzy_matcher, &label, &query)?;
-                            Some((score, PaletteEntry::Action { label, action }))
-                        })
-                        .collect()
-                };
+                // `<leader>sf` (requests only) and `<leader>sc` (commands
+                // only) each skip *scoring* the other half of the list
+                // entirely, rather than scoring-then-hiding it, so neither
+                // can leak in via a lucky fuzzy match.
+                let mut scored: Vec<(u32, PaletteEntry)> =
+                    if self.palette_scope == PaletteScope::RequestsOnly {
+                        Vec::new()
+                    } else {
+                        self.palette_actions()
+                            .into_iter()
+                            .filter_map(|(label, action)| {
+                                let score = fuzzy_score(&mut self.fuzzy_matcher, &label, &query)?;
+                                Some((score, PaletteEntry::Action { label, action }))
+                            })
+                            .collect()
+                    };
 
-                for c in &self.data.collections {
-                    for r in &c.requests {
-                        if let Some(score) = fuzzy_score_request(&mut self.fuzzy_matcher, r, &query)
-                        {
-                            scored.push((
-                                score,
-                                PaletteEntry::Request {
-                                    collection: c.id,
-                                    folder_path: Vec::new(),
-                                    item: Box::new(r.clone()),
-                                },
-                            ));
+                if self.palette_scope != PaletteScope::CommandsOnly {
+                    for c in &self.data.collections {
+                        for r in &c.requests {
+                            if let Some(score) =
+                                fuzzy_score_request(&mut self.fuzzy_matcher, r, &query)
+                            {
+                                scored.push((
+                                    score,
+                                    PaletteEntry::Request {
+                                        collection: c.id,
+                                        folder_path: Vec::new(),
+                                        item: Box::new(r.clone()),
+                                    },
+                                ));
+                            }
                         }
+                        let mut path = Vec::new();
+                        let mut matches = Vec::new();
+                        collect_matching_requests(
+                            &c.folders,
+                            &mut path,
+                            &query,
+                            c.id,
+                            &mut self.fuzzy_matcher,
+                            &mut matches,
+                        );
+                        scored.extend(matches.into_iter().map(
+                            |(score, collection, folder_path, item)| {
+                                (
+                                    score,
+                                    PaletteEntry::Request {
+                                        collection,
+                                        folder_path,
+                                        item: Box::new(item.clone()),
+                                    },
+                                )
+                            },
+                        ));
                     }
-                    let mut path = Vec::new();
-                    let mut matches = Vec::new();
-                    collect_matching_requests(
-                        &c.folders,
-                        &mut path,
-                        &query,
-                        c.id,
-                        &mut self.fuzzy_matcher,
-                        &mut matches,
-                    );
-                    scored.extend(matches.into_iter().map(
-                        |(score, collection, folder_path, item)| {
-                            (
-                                score,
-                                PaletteEntry::Request {
-                                    collection,
-                                    folder_path,
-                                    item: Box::new(item.clone()),
-                                },
-                            )
-                        },
-                    ));
                 }
                 scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
                 scored.truncate(50);
@@ -5340,15 +5396,19 @@ fn render_tree_row(
     focused: bool,
 ) {
     const INDENT_PX: f32 = 16.0;
-    // Emacs-style keyboard navigation cursor (Ctrl+N/P) — a faint fill on a
-    // zero-margin `Frame` so it never changes the row's height (required:
-    // `show_rows` virtualizes on one fixed height for every row).
-    let fill = if focused {
-        ui.visuals().selection.bg_fill.linear_multiply(0.35)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    egui::Frame::new().fill(fill).show(ui, |ui| {
+    // Emacs-style keyboard navigation cursor (Ctrl+N/P) — an accent-colored
+    // outline, not a fill: a fill sat behind the row's own widgets and
+    // visually swallowed their normal mouse-hover highlight (reported: hover
+    // "bị che" — covered). A stroke on a zero-margin `Frame` never paints
+    // over the interior, so widget hover stays visible, and (matching the
+    // active-tab chip's own convention in `tab_bar`) never changes the
+    // row's height either — required since `show_rows` virtualizes on one
+    // fixed height for every row.
+    let mut frame = egui::Frame::new();
+    if focused {
+        frame = frame.stroke(egui::Stroke::new(1.0, theme::ACCENT));
+    }
+    frame.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(row.depth as f32 * INDENT_PX);
             match &row.kind {
@@ -6322,8 +6382,8 @@ impl eframe::App for App {
                     }
                     let mut candidate = self.leader_buffer.clone();
                     candidate.push(c);
-                    if let Some((_, action)) =
-                        LEADER_CHORDS.iter().find(|(seq, _)| *seq == candidate)
+                    if let Some((_, action, _)) =
+                        LEADER_CHORDS.iter().find(|(seq, _, _)| *seq == candidate)
                     {
                         match action {
                             LeaderAction::OpenPalette => {
@@ -6337,7 +6397,7 @@ impl eframe::App for App {
                                     // chord is for jumping straight to a
                                     // request, not a mixed action+request
                                     // list.
-                                    self.palette_requests_only = true;
+                                    self.palette_scope = PaletteScope::RequestsOnly;
                                 }
                             }
                             LeaderAction::SelectEnvironment => {
@@ -6350,9 +6410,18 @@ impl eframe::App for App {
                                 self.search_needs_focus = true;
                                 self.palette_selected = 0;
                                 // Needs the action entries visible at all —
-                                // unlike `<leader>sf`, this isn't a
-                                // requests-only view.
-                                self.palette_requests_only = false;
+                                // unlike `<leader>sf`/`<leader>sc`, this
+                                // isn't a single-kind view.
+                                self.palette_scope = PaletteScope::Combined;
+                            }
+                            LeaderAction::OpenCommandPalette => {
+                                self.search_open = !self.search_open;
+                                if self.search_open {
+                                    self.search_query.clear();
+                                    self.search_needs_focus = true;
+                                    self.palette_selected = 0;
+                                    self.palette_scope = PaletteScope::CommandsOnly;
+                                }
                             }
                             LeaderAction::AssignHotkeyToActiveRequest => {
                                 self.pending_hotkey_assignment =
@@ -6364,7 +6433,7 @@ impl eframe::App for App {
                         self.leader_deadline = None;
                     } else if LEADER_CHORDS
                         .iter()
-                        .any(|(seq, _)| seq.starts_with(candidate.as_str()))
+                        .any(|(seq, _, _)| seq.starts_with(candidate.as_str()))
                     {
                         self.leader_buffer = candidate;
                         self.leader_deadline =
@@ -6380,6 +6449,7 @@ impl eframe::App for App {
                 }
             }
         }
+        self.leader_which_key_hint(ui.ctx());
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.renaming.is_some() {
             self.renaming = None;
         }
@@ -8489,8 +8559,9 @@ mod tests {
             harness.state().search_open,
             "space, then s, then f should open the command palette"
         );
-        assert!(
-            harness.state().palette_requests_only,
+        assert_eq!(
+            harness.state().palette_scope,
+            PaletteScope::RequestsOnly,
             "<leader>sf is the requests-only view, not the combined one"
         );
     }
@@ -8591,6 +8662,83 @@ mod tests {
             harness.state().search_query,
             "Environment:",
             "pre-filled so the palette narrows to just the environment entries"
+        );
+    }
+
+    /// `<leader>sc` opens the palette showing *only* `PaletteAction`s — no
+    /// requests, even for a query that would otherwise fuzzy-match one —
+    /// the commands-only counterpart to `<leader>sf`'s requests-only view.
+    #[test]
+    #[ignore]
+    fn leader_key_space_s_c_shows_commands_only_no_requests() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("New Tab Widget"));
+        data.collections.push(collection);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.key_press(egui::Key::S);
+        harness.step();
+        harness.key_press(egui::Key::C);
+        harness.step();
+
+        assert_eq!(harness.state().palette_scope, PaletteScope::CommandsOnly);
+
+        // "New Tab" fuzzy-matches both the "New Tab" action and the
+        // "New Tab Widget" request — commands-only must show only the
+        // former.
+        harness.state_mut().search_query = "New Tab".to_string();
+        harness.step();
+
+        assert!(harness.query_by_label("> New Tab").is_some());
+        assert!(harness.query_by_label("New Tab Widget").is_none());
+    }
+
+    /// The which-key-style hint popup appears while a leader chord is in
+    /// progress and lists every candidate that still matches, then
+    /// disappears once the chord resolves.
+    #[test]
+    #[ignore]
+    fn leader_which_key_hint_shows_matching_candidates_while_typing() {
+        use egui_kittest::kittest::Queryable;
+
+        let data = AppData::default();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(
+            harness.query_by_label("Search requests").is_some(),
+            "the hint should list every top-level chord right after Space"
+        );
+        assert!(harness.query_by_label("Toggle sidebar").is_some());
+
+        harness.key_press(egui::Key::S);
+        harness.step();
+        assert!(
+            harness.query_by_label("Search requests").is_some(),
+            "still shows the s-prefixed chords"
+        );
+        assert!(
+            harness.query_by_label("Toggle sidebar").is_none(),
+            "no longer a candidate once 's' narrows away from it"
+        );
+
+        harness.key_press(egui::Key::F);
+        harness.step();
+        assert!(
+            harness.query_by_label("Search requests").is_none(),
+            "the hint disappears once the chord resolves"
         );
     }
 
