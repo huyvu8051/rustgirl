@@ -35,6 +35,52 @@ pub fn sniff_language(text: &str) -> Language {
     Language::Plain
 }
 
+/// A user-facing format choice for the request/response body editors' own
+/// dropdown — `Auto` defers to whatever the surrounding code would already
+/// pick (Content-Type header, or `sniff_language` for text with none/an
+/// unhelpful one); every other variant pins the highlighter to a specific
+/// `Language` regardless of what auto-detection would have guessed, for the
+/// case it guesses wrong (e.g. a server that mislabels its Content-Type, or
+/// a Raw body that happens to start with `{` but isn't actually JSON).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LanguageOverride {
+    #[default]
+    Auto,
+    Json,
+    Xml,
+    PlainText,
+}
+
+impl LanguageOverride {
+    pub const ALL: [LanguageOverride; 4] = [
+        LanguageOverride::Auto,
+        LanguageOverride::Json,
+        LanguageOverride::Xml,
+        LanguageOverride::PlainText,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LanguageOverride::Auto => "Auto-detect",
+            LanguageOverride::Json => "JSON",
+            LanguageOverride::Xml => "XML/HTML",
+            LanguageOverride::PlainText => "Plain Text",
+        }
+    }
+
+    /// Resolves to a concrete `Language`, calling `auto_detect` (typically
+    /// `sniff_language`/`language_for_content_type`) only for `Auto` —
+    /// every other variant is a direct, unconditional mapping.
+    pub fn resolve(self, auto_detect: impl FnOnce() -> Language) -> Language {
+        match self {
+            LanguageOverride::Auto => auto_detect(),
+            LanguageOverride::Json => Language::Json,
+            LanguageOverride::Xml => Language::Markup,
+            LanguageOverride::PlainText => Language::Plain,
+        }
+    }
+}
+
 /// Byte ranges in `text` that look like a clickable URL. Not a strict parser —
 /// just enough to underline it in the highlighter and let the caller offer
 /// Option/Alt+Click-to-open without mistaking JSON/XML punctuation around a
@@ -676,5 +722,36 @@ fn highlight_tag(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_override_auto_defers_to_the_closure() {
+        assert_eq!(
+            LanguageOverride::Auto.resolve(|| Language::Markup),
+            Language::Markup
+        );
+    }
+
+    #[test]
+    fn language_override_pins_regardless_of_the_closure() {
+        // The closure returning something else proves these variants really
+        // ignore auto-detection rather than happening to agree with it.
+        assert_eq!(
+            LanguageOverride::Json.resolve(|| Language::Plain),
+            Language::Json
+        );
+        assert_eq!(
+            LanguageOverride::Xml.resolve(|| Language::Plain),
+            Language::Markup
+        );
+        assert_eq!(
+            LanguageOverride::PlainText.resolve(|| Language::Json),
+            Language::Plain
+        );
     }
 }

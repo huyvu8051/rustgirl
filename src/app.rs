@@ -415,6 +415,13 @@ struct OpenTab {
     /// Find-in-body text for this tab's request/response body viewers.
     request_body_find: String,
     response_body_find: String,
+    /// Manual syntax-highlighting override for this tab's Raw request body
+    /// editor and response body viewer respectively — `Auto` (the default)
+    /// defers to Content-Type/sniffing exactly as before; picking JSON/XML/
+    /// Plain Text overrides that guess. Session-only, like the find text
+    /// above — not part of the saved `RequestItem`.
+    request_body_language: syntax::LanguageOverride,
+    response_body_language: syntax::LanguageOverride,
 
     /// VS Code-style "preview" tab: at most one tab is ever a preview at a
     /// time. Navigating the sidebar tree's keyboard cursor (Ctrl+N/P) reuses
@@ -449,6 +456,8 @@ impl OpenTab {
             autosave_last_saved_at: None,
             request_body_find: String::new(),
             response_body_find: String::new(),
+            request_body_language: syntax::LanguageOverride::default(),
+            response_body_language: syntax::LanguageOverride::default(),
             is_preview: false,
         }
     }
@@ -3404,6 +3413,24 @@ impl App {
                             }
                         });
                     }
+                    // Only meaningful for Raw — Json mode's body is already
+                    // unambiguously JSON, nothing to override.
+                    if body.mode == BodyMode::Raw {
+                        ui.horizontal(|ui| {
+                            ui.label("Format:");
+                            egui::ComboBox::from_id_salt("request_body_language")
+                                .selected_text(tab.request_body_language.label())
+                                .show_ui(ui, |ui| {
+                                    for opt in syntax::LanguageOverride::ALL {
+                                        ui.selectable_value(
+                                            &mut tab.request_body_language,
+                                            opt,
+                                            opt.label(),
+                                        );
+                                    }
+                                });
+                        });
+                    }
                     match body.mode {
                         BodyMode::None => {
                             ui.label("This request has no body.");
@@ -3411,7 +3438,9 @@ impl App {
                         BodyMode::Json | BodyMode::Raw => {
                             let language = match body.mode {
                                 BodyMode::Json => syntax::Language::Json,
-                                _ => syntax::sniff_language(&body.raw),
+                                _ => tab
+                                    .request_body_language
+                                    .resolve(|| syntax::sniff_language(&body.raw)),
                             };
                             let dark = ui.visuals().dark_mode;
                             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -3950,11 +3979,33 @@ impl App {
                         resp.body.clone()
                     };
                     let content_type = content_type_of(&resp.headers);
-                    let language = if content_type.is_empty() {
-                        syntax::sniff_language(&text)
-                    } else {
-                        syntax::language_for_content_type(&content_type)
-                    };
+                    let language =
+                        self.tabs[self.active_tab]
+                            .response_body_language
+                            .resolve(|| {
+                                if content_type.is_empty() {
+                                    syntax::sniff_language(&text)
+                                } else {
+                                    syntax::language_for_content_type(&content_type)
+                                }
+                            });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        egui::ComboBox::from_id_salt("response_body_language")
+                            .selected_text(
+                                self.tabs[self.active_tab].response_body_language.label(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for opt in syntax::LanguageOverride::ALL {
+                                    ui.selectable_value(
+                                        &mut self.tabs[self.active_tab].response_body_language,
+                                        opt,
+                                        opt.label(),
+                                    );
+                                }
+                            });
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Find:");
