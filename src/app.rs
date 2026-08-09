@@ -534,6 +534,13 @@ pub struct App {
     /// one-shot-per-frame `tree_force_open` field this replaced.
     expanded_nodes: std::collections::HashSet<Uuid>,
 
+    /// Emacs-style tree navigation cursor — an index into the current
+    /// frame's flattened `model::Row` list (`None` until the user first
+    /// presses one of Ctrl+N/P/F/B in the sidebar). Highlighted in
+    /// `render_tree_row`; Ctrl+N/P move it, Ctrl+F/B expand/collapse the
+    /// row it points to, Enter opens it if it's a request.
+    tree_focused_index: Option<usize>,
+
     /// `Some(request_id)` while the sidebar's "Assign hotkey…" context-menu
     /// entry is waiting for the user to press a `0`-`9`/`a`-`z` key (no
     /// modifier — the *next* raw key, not an Option/Alt-chord) to bind to
@@ -705,6 +712,7 @@ impl App {
             import_message: None,
             renaming: None,
             expanded_nodes: std::collections::HashSet::new(),
+            tree_focused_index: None,
             pending_hotkey_assignment: None,
             leader_buffer: String::new(),
             leader_deadline: None,
@@ -1877,17 +1885,84 @@ impl App {
         let mut renaming = self.renaming.take();
         let mut actions: Vec<PendingAction> = Vec::new();
 
+        // Emacs-style tree navigation: Ctrl+N/P move the cursor, Ctrl+F/B
+        // expand/collapse the row it's on, Enter opens a request (or
+        // toggles expand for a collection/folder). Gated on no widget
+        // having keyboard focus (same guard the leader-key chords use) so
+        // typing "n"/"p"/"f"/"b" in a text field is never affected, and on
+        // the command palette being closed, since it already claims
+        // Ctrl+N/P for its own selection while open.
+        if !rows.is_empty() && !self.search_open && ui.ctx().memory(|m| m.focused().is_none()) {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+                self.tree_focused_index = Some(
+                    self.tree_focused_index
+                        .map_or(0, |i| (i + 1).min(rows.len() - 1)),
+                );
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+                self.tree_focused_index =
+                    Some(self.tree_focused_index.map_or(0, |i| i.saturating_sub(1)));
+            }
+            let focused_row = self.tree_focused_index.and_then(|i| rows.get(i));
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+                && let Some(row) = focused_row
+            {
+                match &row.kind {
+                    model::RowKind::Collection { id } | model::RowKind::Folder { id, .. } => {
+                        self.expanded_nodes.insert(*id);
+                    }
+                    model::RowKind::Request { .. } => {}
+                }
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::B))
+                && let Some(row) = focused_row
+            {
+                match &row.kind {
+                    model::RowKind::Collection { id } | model::RowKind::Folder { id, .. } => {
+                        self.expanded_nodes.remove(id);
+                    }
+                    model::RowKind::Request { .. } => {}
+                }
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                && let Some(row) = focused_row
+            {
+                match &row.kind {
+                    model::RowKind::Request {
+                        collection,
+                        folder_path,
+                        id,
+                    } => {
+                        actions.push(PendingAction::Load {
+                            collection: *collection,
+                            folder_path: folder_path.clone(),
+                            id: *id,
+                        });
+                    }
+                    model::RowKind::Collection { id } | model::RowKind::Folder { id, .. } => {
+                        if self.expanded_nodes.contains(id) {
+                            self.expanded_nodes.remove(id);
+                        } else {
+                            self.expanded_nodes.insert(*id);
+                        }
+                    }
+                }
+            }
+        }
+
         // A single fixed row height for every row kind — required by
         // `show_rows` (confirmed against the cached egui source: it only
         // takes one `row_height_sans_spacing`, not a per-row callback), and
         // safe here since every row's content is already single-line
         // (long request names are truncated with an ellipsis, not wrapped).
         let row_height = ui.spacing().interact_size.y;
+        let tree_focused_index = self.tree_focused_index;
         egui::ScrollArea::vertical()
             .id_salt("collections_tree_rows")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
-                for row in &rows[range] {
+                let start = range.start;
+                for (i, row) in rows[range].iter().enumerate() {
                     render_tree_row(
                         ui,
                         row,
@@ -1896,6 +1971,7 @@ impl App {
                         &open_ids,
                         &mut renaming,
                         &mut actions,
+                        tree_focused_index == Some(start + i),
                     );
                 }
             });
@@ -5261,50 +5337,61 @@ fn render_tree_row(
     open_ids: &std::collections::HashSet<Uuid>,
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
+    focused: bool,
 ) {
     const INDENT_PX: f32 = 16.0;
-    ui.horizontal(|ui| {
-        ui.add_space(row.depth as f32 * INDENT_PX);
-        match &row.kind {
-            model::RowKind::Collection { id } => {
-                render_collection_row(ui, *id, &row.name, expanded, renaming, actions);
-            }
-            model::RowKind::Folder {
-                collection,
-                parent_path,
-                id,
-            } => {
-                render_folder_row(
-                    ui,
-                    *collection,
+    // Emacs-style keyboard navigation cursor (Ctrl+N/P) — a faint fill on a
+    // zero-margin `Frame` so it never changes the row's height (required:
+    // `show_rows` virtualizes on one fixed height for every row).
+    let fill = if focused {
+        ui.visuals().selection.bg_fill.linear_multiply(0.35)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    egui::Frame::new().fill(fill).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(row.depth as f32 * INDENT_PX);
+            match &row.kind {
+                model::RowKind::Collection { id } => {
+                    render_collection_row(ui, *id, &row.name, expanded, renaming, actions);
+                }
+                model::RowKind::Folder {
+                    collection,
                     parent_path,
-                    *id,
-                    &row.name,
-                    expanded,
-                    renaming,
-                    actions,
-                );
-            }
-            model::RowKind::Request {
-                collection,
-                folder_path,
-                id,
-            } => {
-                render_request_row(
-                    ui,
-                    *collection,
+                    id,
+                } => {
+                    render_folder_row(
+                        ui,
+                        *collection,
+                        parent_path,
+                        *id,
+                        &row.name,
+                        expanded,
+                        renaming,
+                        actions,
+                    );
+                }
+                model::RowKind::Request {
+                    collection,
                     folder_path,
-                    *id,
-                    &row.name,
-                    row.method,
-                    row.hotkey,
-                    active_id,
-                    open_ids,
-                    renaming,
-                    actions,
-                );
+                    id,
+                } => {
+                    render_request_row(
+                        ui,
+                        *collection,
+                        folder_path,
+                        *id,
+                        &row.name,
+                        row.method,
+                        row.hotkey,
+                        active_id,
+                        open_ids,
+                        renaming,
+                        actions,
+                    );
+                }
             }
-        }
+        });
     });
 }
 
@@ -7697,6 +7784,71 @@ mod tests {
             1,
             "Option+H moves to the previous tab"
         );
+    }
+
+    /// Emacs-style tree navigation: Ctrl+N/P move the cursor down/up through
+    /// the flattened rows, Ctrl+F expands the row it's on, and Enter opens a
+    /// focused request into a new tab.
+    #[test]
+    #[ignore]
+    fn emacs_style_keys_navigate_expand_and_open_in_the_tree() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Get Users"));
+        let mut auth = Folder::new("Auth");
+        auth.requests.push(RequestItem::new("Login"));
+        collection.folders.push(auth);
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        // Nothing focused yet: Ctrl+N puts the cursor on the only visible
+        // row, the collapsed "Demo" collection.
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().tree_focused_index, Some(0));
+
+        // Ctrl+F expands it — same two-step lag every expand/collapse
+        // click already has (`flatten_visible_rows` is recomputed once at
+        // the top of the next frame, not the one the click lands in).
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        harness.step();
+        harness.step();
+
+        // Now: Demo(0), Get Users(1), Auth(2). Ctrl+N twice lands on "Auth".
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().tree_focused_index, Some(2));
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        harness.step();
+        harness.step();
+
+        // Now: Demo(0), Get Users(1), Auth(2), Login(3).
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().tree_focused_index, Some(3));
+
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+
+        assert_eq!(harness.state().tabs.len(), 2, "Enter opened a new tab");
+        assert_eq!(
+            harness.state().tabs[harness.state().active_tab]
+                .current_request
+                .name,
+            "Login"
+        );
+
+        // Ctrl+P moves back up.
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
+        harness.step();
+        assert_eq!(harness.state().tree_focused_index, Some(2));
     }
 
     /// Ctrl+O/Ctrl+I (Vim's own jumplist convention) walk back and forth
