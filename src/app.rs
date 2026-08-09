@@ -560,7 +560,21 @@ pub struct App {
     /// presses one of Ctrl+N/P/F/B in the sidebar). Highlighted in
     /// `render_tree_row`; Ctrl+N/P move it, Ctrl+F/B expand/collapse the
     /// row it points to, Enter opens it if it's a request.
+    ///
+    /// Same Ctrl+N/P/Enter convention reused for the History and
+    /// Environments sidebar tabs (`history_focused_index`/
+    /// `environments_focused_index`, right below) — each keyed to its own
+    /// list, since only one sidebar tab is ever rendered at a time
+    /// (`sidebar_tab`), which is what scopes the shortcuts to "whichever
+    /// pane you're looking at," the same way clicking between panes in a
+    /// native macOS app changes which one arrow keys apply to.
     tree_focused_index: Option<usize>,
+    /// Ctrl+N/P cursor for the History sidebar tab (Enter re-opens that
+    /// entry, same as clicking it). `None` until first used.
+    history_focused_index: Option<usize>,
+    /// Ctrl+N/P cursor for the Environments sidebar tab (Enter switches to
+    /// it, same as clicking it). `None` until first used.
+    environments_focused_index: Option<usize>,
 
     /// `Some(request_id)` while the sidebar's "Assign hotkey…" context-menu
     /// entry is waiting for the user to press a `0`-`9`/`a`-`z` key (no
@@ -732,6 +746,8 @@ impl App {
             renaming: None,
             expanded_nodes: std::collections::HashSet::new(),
             tree_focused_index: None,
+            history_focused_index: None,
+            environments_focused_index: None,
             pending_hotkey_assignment: None,
             leader_buffer: String::new(),
             leader_deadline: None,
@@ -2509,34 +2525,50 @@ impl App {
         import_message_banner(ui, &mut self.import_message);
         ui.separator();
 
+        let enter_pressed = handle_list_nav_keys(
+            ui,
+            self.search_open,
+            self.data.environments.len(),
+            &mut self.environments_focused_index,
+        );
+
         let mut delete_env: Option<Uuid> = None;
         let mut export_env: Option<Uuid> = None;
-        for env in &self.data.environments {
-            ui.horizontal(|ui| {
-                let is_active = self.active_environment == Some(env.id);
-                if ui.selectable_label(is_active, &env.name).clicked() {
-                    self.active_environment = Some(env.id);
-                }
-                if ui
-                    .small_button("edit")
-                    .on_hover_text(format!("Edit {}", env.name))
-                    .clicked()
-                {
-                    self.central_view = CentralView::EnvironmentEditor(env.id);
-                }
-                if ui
-                    .small_button("📤")
-                    .on_hover_text(format!(
-                        "Export {} as a Postman environment (.json)",
-                        env.name
-                    ))
-                    .clicked()
-                {
-                    export_env = Some(env.id);
-                }
-                if icon_button(ui, "🗑", &format!("Delete {}", env.name)).clicked() {
-                    delete_env = Some(env.id);
-                }
+        for (i, env) in self.data.environments.iter().enumerate() {
+            if enter_pressed && Some(i) == self.environments_focused_index {
+                self.active_environment = Some(env.id);
+            }
+            let mut frame = egui::Frame::new();
+            if Some(i) == self.environments_focused_index {
+                frame = frame.stroke(egui::Stroke::new(1.0, theme::ACCENT));
+            }
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let is_active = self.active_environment == Some(env.id);
+                    if ui.selectable_label(is_active, &env.name).clicked() {
+                        self.active_environment = Some(env.id);
+                    }
+                    if ui
+                        .small_button("edit")
+                        .on_hover_text(format!("Edit {}", env.name))
+                        .clicked()
+                    {
+                        self.central_view = CentralView::EnvironmentEditor(env.id);
+                    }
+                    if ui
+                        .small_button("📤")
+                        .on_hover_text(format!(
+                            "Export {} as a Postman environment (.json)",
+                            env.name
+                        ))
+                        .clicked()
+                    {
+                        export_env = Some(env.id);
+                    }
+                    if icon_button(ui, "🗑", &format!("Delete {}", env.name)).clicked() {
+                        delete_env = Some(env.id);
+                    }
+                });
             });
         }
         if let Some(id) = export_env {
@@ -2566,7 +2598,17 @@ impl App {
             self.save();
         }
         ui.separator();
-        let mut load: Option<usize> = None;
+        let enter_pressed = handle_list_nav_keys(
+            ui,
+            self.search_open,
+            self.data.history.len(),
+            &mut self.history_focused_index,
+        );
+        let mut load: Option<usize> = if enter_pressed {
+            self.history_focused_index
+        } else {
+            None
+        };
         for (i, entry) in self.data.history.iter().enumerate() {
             let status = match (entry.status, &entry.error) {
                 (Some(status), _) => status.to_string(),
@@ -2578,11 +2620,17 @@ impl App {
                 .map(|ms| format!(" {ms}ms"))
                 .unwrap_or_default();
             let label = format!("{} [{}]{}", entry.url, status, duration);
-            ui.horizontal(|ui| {
-                ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
-                if ui.selectable_label(false, label).clicked() {
-                    load = Some(i);
-                }
+            let mut frame = egui::Frame::new();
+            if Some(i) == self.history_focused_index {
+                frame = frame.stroke(egui::Stroke::new(1.0, theme::ACCENT));
+            }
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::method_color(entry.method), entry.method.as_str());
+                    if ui.selectable_label(false, label).clicked() {
+                        load = Some(i);
+                    }
+                });
             });
         }
         // Restores both the request definition *and* the exact response
@@ -5325,6 +5373,36 @@ fn insert_all_folder_ids(folders: &[Folder], expanded: &mut std::collections::Ha
     }
 }
 
+/// Shared Ctrl+N/P cursor-move logic for a plain (non-tree) sidebar list —
+/// History, Environments. Moves `*focused` up/down within `0..len`, gated
+/// on nothing having keyboard focus and the command palette being closed
+/// (same guard the tree's own Ctrl+N/P uses, and the same reasoning: a
+/// text field's typing shouldn't be hijacked, and the palette already owns
+/// these keys while open). Only one sidebar tab ever renders at a time
+/// (`sidebar_tab`), which is what scopes these keys to "whichever list
+/// you're currently looking at" — the same way clicking between panes in
+/// a native macOS app changes which one arrow keys apply to, without
+/// needing a separate explicit "focused panel" concept here.
+/// Returns whether Enter was pressed this frame, so the caller decides
+/// what "open the focused row" means for its own list.
+fn handle_list_nav_keys(
+    ui: &mut egui::Ui,
+    search_open: bool,
+    len: usize,
+    focused: &mut Option<usize>,
+) -> bool {
+    if len == 0 || search_open || ui.ctx().memory(|m| m.focused().is_some()) {
+        return false;
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+        *focused = Some(focused.map_or(0, |i| (i + 1).min(len - 1)));
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+        *focused = Some(focused.map_or(0, |i| i.saturating_sub(1)));
+    }
+    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+}
+
 /// A small clickable expand/collapse toggle rendered as a real triangle
 /// icon — drawn with `Painter` shapes via egui's own
 /// `collapsing_header::paint_default_icon` (the exact routine
@@ -7919,6 +7997,84 @@ mod tests {
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
         harness.step();
         assert_eq!(harness.state().tree_focused_index, Some(2));
+    }
+
+    /// The same Ctrl+N/P/Enter convention works on the History sidebar tab —
+    /// scoped there for free since only one sidebar tab renders at a time
+    /// (no separate "focused panel" concept needed).
+    #[test]
+    #[ignore]
+    fn emacs_style_keys_navigate_and_open_in_history() {
+        let mut data = AppData::default();
+        for url in ["https://example.com/a", "https://example.com/b"] {
+            let mut request = RequestItem::new(url);
+            request.url = url.to_string();
+            data.history.push(HistoryEntry {
+                id: Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                method: Method::Get,
+                url: url.to_string(),
+                status: Some(200),
+                request,
+                sent_request: None,
+                response: None,
+                error: None,
+                duration_ms: Some(10),
+                test_results: vec![],
+            });
+        }
+        let mut app = App::with_data(data);
+        app.sidebar_tab = SidebarTab::History;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| app);
+        harness.step();
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().history_focused_index, Some(0));
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().history_focused_index, Some(1));
+
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+
+        assert_eq!(harness.state().tabs.len(), 2, "Enter opened a new tab");
+        assert_eq!(
+            harness.state().tabs[harness.state().active_tab]
+                .current_request
+                .url,
+            "https://example.com/b"
+        );
+    }
+
+    /// Same convention on the Environments sidebar tab — Enter switches the
+    /// active environment instead of opening a tab.
+    #[test]
+    #[ignore]
+    fn emacs_style_keys_navigate_and_switch_environment() {
+        let mut data = AppData::default();
+        data.environments.push(Environment::new("Dev"));
+        data.environments.push(Environment::new("Staging"));
+        let staging_id = data.environments[1].id;
+        let mut app = App::with_data(data);
+        app.sidebar_tab = SidebarTab::Environments;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| app);
+        harness.step();
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.step();
+        assert_eq!(harness.state().environments_focused_index, Some(1));
+
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+
+        assert_eq!(harness.state().active_environment, Some(staging_id));
     }
 
     /// Ctrl+O/Ctrl+I (Vim's own jumplist convention) walk back and forth
