@@ -415,6 +415,14 @@ struct OpenTab {
     /// Find-in-body text for this tab's request/response body viewers.
     request_body_find: String,
     response_body_find: String,
+
+    /// VS Code-style "preview" tab: at most one tab is ever a preview at a
+    /// time. Navigating the sidebar tree's keyboard cursor (Ctrl+N/P) reuses
+    /// this same tab slot for whatever request the cursor currently sits
+    /// on, instead of opening a new tab for every row stepped over — Enter
+    /// (or `open_request_in_tab`'s own normal open path) "pins" it by
+    /// clearing this flag, after which it behaves like any other tab.
+    is_preview: bool,
 }
 
 impl OpenTab {
@@ -441,6 +449,7 @@ impl OpenTab {
             autosave_last_saved_at: None,
             request_body_find: String::new(),
             response_body_find: String::new(),
+            is_preview: false,
         }
     }
 
@@ -1961,17 +1970,43 @@ impl App {
         // the command palette being closed, since it already claims
         // Ctrl+N/P for its own selection while open.
         if !rows.is_empty() && !self.search_open && ui.ctx().memory(|m| m.focused().is_none()) {
+            let mut cursor_moved = false;
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
                 self.tree_focused_index = Some(
                     self.tree_focused_index
                         .map_or(0, |i| (i + 1).min(rows.len() - 1)),
                 );
+                cursor_moved = true;
             }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
                 self.tree_focused_index =
                     Some(self.tree_focused_index.map_or(0, |i| i.saturating_sub(1)));
+                cursor_moved = true;
             }
             let focused_row = self.tree_focused_index.and_then(|i| rows.get(i));
+            // VS Code-style preview: stepping the keyboard cursor onto a
+            // request opens it into the single reusable preview tab
+            // (`preview_open_request`) instead of piling up a new tab per
+            // row stepped over — only on the frame the cursor actually
+            // moved, not every frame, so it doesn't fight the user
+            // interacting with whatever's already showing in that tab.
+            if cursor_moved
+                && let Some(model::RowKind::Request {
+                    collection,
+                    folder_path,
+                    id,
+                }) = focused_row.map(|r| &r.kind)
+                && let Some(req) = self
+                    .data
+                    .collections
+                    .iter()
+                    .find(|c| c.id == *collection)
+                    .and_then(|c| c.requests_at(folder_path))
+                    .and_then(|list| list.iter().find(|r| r.id == *id))
+                    .cloned()
+            {
+                self.preview_open_request(*collection, folder_path.clone(), req);
+            }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
                 && let Some(row) = focused_row
             {
@@ -2363,6 +2398,45 @@ impl App {
             None => {
                 self.tabs
                     .push(OpenTab::from_saved(collection, folder_path, req));
+                self.active_tab = self.tabs.len() - 1;
+            }
+        }
+        // "Really" opening a request (as opposed to the tree's Ctrl+N/P
+        // preview cursor, `preview_open_request`) always pins it — this is
+        // every other way a request gets opened (a click, a hotkey jump,
+        // the search palette, Enter on the tree), so clearing the flag
+        // here covers all of them in one place.
+        self.tabs[self.active_tab].is_preview = false;
+        self.central_view = CentralView::Request;
+    }
+
+    /// VS Code-style "preview" open: reuses the single existing preview tab
+    /// (if any) for `req` instead of opening a brand-new one — used by the
+    /// sidebar tree's Ctrl+N/P keyboard cursor, so stepping through rows
+    /// doesn't pile up a tab per row stepped over. `open_request_in_tab`
+    /// (Enter, a click, ...) "pins" whatever tab it targets by clearing its
+    /// `is_preview` flag, after which this function leaves it alone.
+    fn preview_open_request(&mut self, collection: Uuid, folder_path: Vec<Uuid>, req: RequestItem) {
+        let already_open = self.tabs.iter().position(|t| {
+            matches!(&t.origin, RequestOrigin::Collection { collection: c, folder_path: fp, request }
+                if *c == collection && *fp == folder_path && *request == req.id)
+        });
+        if let Some(idx) = already_open {
+            // Already open, pinned or not — just focus it, don't touch
+            // its pinned state either way.
+            self.active_tab = idx;
+            return;
+        }
+        match self.tabs.iter().position(|t| t.is_preview) {
+            Some(idx) => {
+                self.tabs[idx] = OpenTab::from_saved(collection, folder_path, req);
+                self.tabs[idx].is_preview = true;
+                self.active_tab = idx;
+            }
+            None => {
+                let mut tab = OpenTab::from_saved(collection, folder_path, req);
+                tab.is_preview = true;
+                self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
             }
         }
@@ -3063,8 +3137,19 @@ impl App {
                                     } else {
                                         tab.current_request.name.as_str()
                                     };
-                                    let selected =
-                                        ui.selectable_label(idx == self.active_tab, name).clicked();
+                                    // VS Code-style preview tab: italicized
+                                    // name, same visual convention that app
+                                    // uses to mark "this will be replaced by
+                                    // the next thing you preview, until you
+                                    // pin it" (Enter, or any real open).
+                                    let name_text: egui::WidgetText = if tab.is_preview {
+                                        egui::RichText::new(name).italics().into()
+                                    } else {
+                                        name.into()
+                                    };
+                                    let selected = ui
+                                        .selectable_label(idx == self.active_tab, name_text)
+                                        .clicked();
                                     if let Some(key) =
                                         hotkeys_by_request.get(&tab.current_request.id)
                                     {
@@ -7966,31 +8051,63 @@ mod tests {
         harness.step();
         harness.step();
 
-        // Now: Demo(0), Get Users(1), Auth(2). Ctrl+N twice lands on "Auth".
+        // Now: Demo(0), Get Users(1), Auth(2). Ctrl+N onto "Get Users" (a
+        // request) previews it into a single reusable tab — VS Code-style,
+        // not a permanent tab yet.
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
         harness.step();
+        assert_eq!(harness.state().tabs.len(), 2, "opened a preview tab");
+        let preview_idx = harness.state().active_tab;
+        assert!(harness.state().tabs[preview_idx].is_preview);
+        assert_eq!(
+            harness.state().tabs[preview_idx].current_request.name,
+            "Get Users"
+        );
+
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
         harness.step();
         assert_eq!(harness.state().tree_focused_index, Some(2));
+        // "Auth" isn't a request — no new preview, the "Get Users" one
+        // from a moment ago is left exactly as it was.
+        assert_eq!(harness.state().tabs.len(), 2);
 
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
         harness.step();
         harness.step();
 
-        // Now: Demo(0), Get Users(1), Auth(2), Login(3).
+        // Now: Demo(0), Get Users(1), Auth(2), Login(3). Stepping onto
+        // "Login" *reuses* the same preview tab slot instead of opening a
+        // third one.
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
         harness.step();
         assert_eq!(harness.state().tree_focused_index, Some(3));
-
-        harness.key_press(egui::Key::Enter);
-        harness.step();
-
-        assert_eq!(harness.state().tabs.len(), 2, "Enter opened a new tab");
+        assert_eq!(
+            harness.state().tabs.len(),
+            2,
+            "the preview tab was reused for Login, not a new one opened"
+        );
+        assert!(harness.state().tabs[harness.state().active_tab].is_preview);
         assert_eq!(
             harness.state().tabs[harness.state().active_tab]
                 .current_request
                 .name,
             "Login"
+        );
+
+        // Enter pins it — same tab, no longer a preview.
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+
+        assert_eq!(harness.state().tabs.len(), 2, "still the same 2 tabs");
+        assert_eq!(
+            harness.state().tabs[harness.state().active_tab]
+                .current_request
+                .name,
+            "Login"
+        );
+        assert!(
+            !harness.state().tabs[harness.state().active_tab].is_preview,
+            "Enter pins the tab — no longer a preview"
         );
 
         // Ctrl+P moves back up.
