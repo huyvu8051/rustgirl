@@ -1827,6 +1827,20 @@ impl App {
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(280.0)
+            .min_size(180.0)
+            // Without an explicit cap, `Panel`'s own max defaults to
+            // (effectively) the whole window width — a real, reported bug:
+            // a row whose label reports a wide "ideal" size before
+            // `.truncate()` has anything definite to truncate against gets
+            // measured at that width, which then gets *persisted* as the
+            // panel's own size (`PanelState`), so it never shrinks back.
+            // Long request names/search results (in the collection tree
+            // *and* the command palette, which needs the equivalent
+            // `.max_width()` fix on its `Window`) made this a real,
+            // reproducible growth — see `_tmp_check_long_name_width`-style
+            // manual repro during investigation. A hard `max_size` breaks
+            // that feedback loop outright, regardless of content.
+            .max_size(480.0)
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2835,6 +2849,14 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
             .default_width(520.0)
+            // `resizable(false)` only disables the user's own drag handle —
+            // it doesn't stop the window auto-sizing to a wide row's
+            // content (a real, reported bug: a long request name/URL grew
+            // this window well past 520). Same fix as the sidebar's own
+            // `Panel::max_size` — a hard cap, plus `.truncate()` on the row
+            // labels below so long text still shows "…" instead of just
+            // being cut off with nothing indicating it.
+            .max_width(600.0)
             .show(ctx, |ui| {
                 let hint = match self.palette_scope {
                     PaletteScope::RequestsOnly => "Search requests\u{2026}",
@@ -2988,16 +3010,28 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| match entry {
                                         PaletteEntry::Action { label, .. } => {
-                                            ui.label(format!("> {label}"));
+                                            ui.add(
+                                                egui::Label::new(format!("> {label}")).truncate(),
+                                            );
                                         }
                                         PaletteEntry::Request { item, .. } => {
                                             ui.colored_label(
                                                 theme::method_color(item.method),
                                                 item.method.as_str(),
                                             );
-                                            ui.label(&item.name);
+                                            // `.truncate()` on both — either
+                                            // a long request name or a long
+                                            // URL was enough on its own to
+                                            // grow the window (see the
+                                            // `Window::max_width` fix above).
+                                            ui.add(egui::Label::new(&item.name).truncate());
                                             ui.weak("—");
-                                            ui.weak(&item.url);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&item.url).weak(),
+                                                )
+                                                .truncate(),
+                                            );
                                         }
                                     });
                                 });
