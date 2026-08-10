@@ -11,6 +11,7 @@ use crate::postman_format;
 use crate::scripting;
 use crate::storage;
 use crate::syntax;
+use crate::vim_editor;
 use eframe::egui;
 use reqwest_cookie_store::CookieStoreMutex;
 use std::sync::mpsc::{Receiver, Sender};
@@ -3469,12 +3470,20 @@ impl App {
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
                             let content_snapshot = body.raw.clone();
-                            let text_edit = egui::TextEdit::multiline(&mut body.raw)
-                                .code_editor()
-                                .desired_rows(10)
-                                .desired_width(f32::INFINITY)
-                                .layouter(&mut layouter);
-                            show_code_editor_with_links(ui, &content_snapshot, text_edit);
+                            show_code_editor_with_links(
+                                ui,
+                                egui::Id::new("request_body_raw_editor"),
+                                &content_snapshot,
+                                &mut body.raw,
+                                self.settings.vim_mode_enabled,
+                                false,
+                                |te| {
+                                    te.code_editor()
+                                        .desired_rows(10)
+                                        .desired_width(f32::INFINITY)
+                                        .layouter(&mut layouter)
+                                },
+                            );
                         }
                         BodyMode::Form => {
                             key_value_table(ui, "form_table", &mut body.form);
@@ -3491,13 +3500,23 @@ impl App {
                     let tab = &mut self.tabs[self.active_tab];
                     ui.label("Runs before the request is sent. Available: pm.environment/pm.globals/pm.collectionVariables .get/set(key, value), pm.variables.get(key), pm.request.url/method/body, pm.request:getHeader/setHeader(key, value), pm.sendRequest(urlOrTable, function(err, response) ... end), console.log(...).");
                     snippet_buttons(ui, PRE_REQUEST_SNIPPETS, &mut tab.current_request.pre_request_script);
-                    script_editor(ui, "pre_request_script_editor", &mut tab.current_request.pre_request_script);
+                    script_editor(
+                        ui,
+                        "pre_request_script_editor",
+                        &mut tab.current_request.pre_request_script,
+                        self.settings.vim_mode_enabled,
+                    );
                 }
                 RequestTab::TestsScript => {
                     let tab = &mut self.tabs[self.active_tab];
                     ui.label("Runs after the response arrives. Available: pm.response.status/body/duration_ms/error, pm.response:getHeader(key), pm.response:json(), pm.environment/pm.globals/pm.collectionVariables .get/set(key, value), pm.variables.get(key), pm.test(name, function() ... end), pm.sendRequest(urlOrTable, function(err, response) ... end), console.log(...).");
                     snippet_buttons(ui, TEST_SNIPPETS, &mut tab.current_request.post_response_script);
-                    script_editor(ui, "tests_script_editor", &mut tab.current_request.post_response_script);
+                    script_editor(
+                        ui,
+                        "tests_script_editor",
+                        &mut tab.current_request.post_response_script,
+                        self.settings.vim_mode_enabled,
+                    );
                 }
                 RequestTab::Code => {
                     egui::ComboBox::from_id_salt("codegen_target_combo")
@@ -4053,11 +4072,19 @@ impl App {
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
                     let mut text_copy = text.clone();
-                    let text_edit = egui::TextEdit::multiline(&mut text_copy)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .layouter(&mut layouter);
-                    show_code_editor_with_links(ui, &text, text_edit);
+                    show_code_editor_with_links(
+                        ui,
+                        egui::Id::new("response_body_viewer"),
+                        &text,
+                        &mut text_copy,
+                        self.settings.vim_mode_enabled,
+                        true,
+                        |te| {
+                            te.code_editor()
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter)
+                        },
+                    );
                 }
                 ResponseTab::Headers => {
                     let Some(resp) = &effective_response else {
@@ -4130,11 +4157,24 @@ impl App {
                                 ui.fonts_mut(|f| f.layout_job(job))
                             };
                         let mut body_copy = body.clone();
-                        let text_edit = egui::TextEdit::multiline(&mut body_copy)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .layouter(&mut layouter);
-                        show_code_editor_with_links(ui, body, text_edit);
+                        // No Vim mode here on purpose — this is a read-only
+                        // diagnostic replay of exactly what was sent, a
+                        // lower-traffic view than the live response body,
+                        // which already covers the read-only navigation
+                        // case (see `Settings.vim_mode_enabled`'s own doc).
+                        show_code_editor_with_links(
+                            ui,
+                            egui::Id::new("sent_request_body_viewer"),
+                            body,
+                            &mut body_copy,
+                            false,
+                            true,
+                            |te| {
+                                te.code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .layouter(&mut layouter)
+                            },
+                        );
                     }
                 }
                 ResponseTab::TestResults => {
@@ -4398,6 +4438,7 @@ impl App {
             ui,
             "collection_pre_request_script",
             &mut collection.pre_request_script,
+            self.settings.vim_mode_enabled,
         );
         ui.add_space(8.0);
         ui.label("Tests Script (runs after every response in this collection):");
@@ -4406,6 +4447,7 @@ impl App {
             ui,
             "collection_post_response_script",
             &mut collection.post_response_script,
+            self.settings.vim_mode_enabled,
         );
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
@@ -4448,6 +4490,7 @@ impl App {
             ui,
             "folder_pre_request_script",
             &mut folder.pre_request_script,
+            self.settings.vim_mode_enabled,
         );
         ui.add_space(8.0);
         ui.label("Tests Script (runs after every response in this folder):");
@@ -4456,6 +4499,7 @@ impl App {
             ui,
             "folder_post_response_script",
             &mut folder.post_response_script,
+            self.settings.vim_mode_enabled,
         );
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
@@ -4754,6 +4798,19 @@ impl App {
 
         ui.add_space(12.0);
         ui.separator();
+        ui.label("Editing");
+        ui.checkbox(
+            &mut self.settings.vim_mode_enabled,
+            "Vim mode for text editors",
+        );
+        ui.weak(
+            "Normal/Insert/Visual — h/j/k/l, w/b/e, 0/$, gg/G, i/a/o, d/y/p, v — \
+             for the request body/script editors. Response body is \
+             navigation + yank-to-copy only (it's read-only).",
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
         ui.label("Proxy");
         ui.checkbox(&mut self.settings.proxy.enabled, "Use custom proxy");
         if self.settings.proxy.enabled {
@@ -4856,20 +4913,36 @@ fn open_in_browser(url: &str) {
 /// is held, turns any detected URL in `content` (a snapshot of the same text
 /// the `TextEdit` is displaying) into a click-to-open link: pointer cursor on
 /// hover, opens in the system browser on click.
-fn show_code_editor_with_links(ui: &mut egui::Ui, content: &str, text_edit: egui::TextEdit<'_>) {
+/// `text`/`configure` build the actual `TextEdit` through
+/// `vim_editor::vim_multiline_edit` (so this editor gets Vim mode when
+/// `vim_enabled` — see `Settings.vim_mode_enabled`) rather than taking a
+/// pre-built `TextEdit`, since the Vim layer needs to own the `.show()`
+/// call itself (to intercept keys first, then read back the resulting
+/// galley for this function's own Option/Alt+click-to-open-link handling).
+#[allow(clippy::too_many_arguments)]
+fn show_code_editor_with_links<'a>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    content: &str,
+    text: &'a mut String,
+    vim_enabled: bool,
+    vim_readonly: bool,
+    configure: impl FnOnce(egui::TextEdit<'a>) -> egui::TextEdit<'a>,
+) {
     let links = syntax::detect_links(content);
-    let output = text_edit.show(ui);
+    let (response, galley, galley_pos) =
+        vim_editor::vim_multiline_edit(ui, id, text, vim_enabled, vim_readonly, configure);
     if links.is_empty() {
         return;
     }
     if !ui.input(|i| i.modifiers.alt) {
         return;
     }
-    let Some(hover_pos) = output.response.hover_pos() else {
+    let Some(hover_pos) = response.hover_pos() else {
         return;
     };
-    let rel_pos = hover_pos - output.galley_pos;
-    let char_idx = output.galley.cursor_from_pos(rel_pos).index.0;
+    let rel_pos = hover_pos - galley_pos;
+    let char_idx = galley.cursor_from_pos(rel_pos).index.0;
     let byte_idx = content
         .char_indices()
         .nth(char_idx)
@@ -4877,7 +4950,7 @@ fn show_code_editor_with_links(ui: &mut egui::Ui, content: &str, text_edit: egui
         .unwrap_or(content.len());
     if let Some(range) = links.iter().find(|r| r.contains(&byte_idx)) {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-        if output.response.clicked() {
+        if response.clicked() {
             open_in_browser(&content[range.clone()]);
         }
     }
@@ -5383,13 +5456,19 @@ fn snippet_buttons(ui: &mut egui::Ui, snippets: &[(&str, &str)], script: &mut St
 /// A plain monospace multiline editor for Lua scripts. No syntax
 /// highlighting (`syntax.rs` only knows JSON/HTML/plain text) — good enough
 /// for a first pass at pre-request/post-response scripting.
-fn script_editor(ui: &mut egui::Ui, id_salt: &str, script: &mut String) {
+fn script_editor(ui: &mut egui::Ui, id_salt: &str, script: &mut String, vim_enabled: bool) {
     ui.push_id(id_salt, |ui| {
-        ui.add(
-            egui::TextEdit::multiline(script)
-                .code_editor()
-                .desired_rows(12)
-                .desired_width(f32::INFINITY),
+        vim_editor::vim_multiline_edit(
+            ui,
+            egui::Id::new(id_salt),
+            script,
+            vim_enabled,
+            false,
+            |te| {
+                te.code_editor()
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY)
+            },
         );
     });
 }

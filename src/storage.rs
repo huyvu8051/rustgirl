@@ -1029,6 +1029,7 @@ mod tests {
                 client_cert_path: None,
             },
             theme: crate::model::ThemeMode::Dark,
+            vim_mode_enabled: true,
         };
         save_settings_to(&settings, &path);
         let loaded = load_settings_from(&path);
@@ -1044,6 +1045,7 @@ mod tests {
             settings.tls.custom_ca_cert_path
         );
         assert_eq!(loaded.theme, settings.theme);
+        assert_eq!(loaded.vim_mode_enabled, settings.vim_mode_enabled);
 
         // Missing file (never saved yet) is defaults, not an error.
         let defaults = load_settings_from(&tmp.0.join("missing.json"));
@@ -1060,6 +1062,7 @@ mod tests {
         std::fs::write(&path, r#"{"proxy":{"enabled":false,"http_proxy":"","https_proxy":"","no_proxy":""},"tls":{"accept_invalid_certs":false,"custom_ca_cert_path":null,"client_cert_path":null}}"#).unwrap();
         let loaded = load_settings_from(&path);
         assert_eq!(loaded.theme, crate::model::ThemeMode::System);
+        assert!(!loaded.vim_mode_enabled);
     }
 
     /// No network needed at all — `cookie_store::CookieStore` is a plain

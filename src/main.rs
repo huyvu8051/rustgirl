@@ -9,6 +9,7 @@ mod postman_format;
 mod scripting;
 mod storage;
 mod syntax;
+mod vim_editor;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

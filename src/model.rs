@@ -1308,6 +1308,13 @@ pub struct Settings {
     /// users until they actually pick something.
     #[serde(default)]
     pub theme: ThemeMode,
+    /// Vim-style modal editing (Normal/Insert/Visual — h/j/k/l, d/y/p, ...)
+    /// for the request body/script editors and (navigation + yank only)
+    /// the response body viewer. Off by default — absent in `settings.json`
+    /// files saved before this feature existed, so nothing changes for
+    /// existing users until they turn it on.
+    #[serde(default)]
+    pub vim_mode_enabled: bool,
 }
 
 /// A local, serializable mirror of `egui::ThemePreference` — that egui type
