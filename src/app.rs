@@ -1986,6 +1986,12 @@ impl App {
         let mut renaming = self.renaming.take();
         let mut actions: Vec<PendingAction> = Vec::new();
 
+        // Whether Ctrl+N/P moved the cursor this frame — used below to
+        // scroll the tree so the new focused row stays visible (a click
+        // never needs this: you can't click a row `show_rows` didn't
+        // render in the first place, so it's always already on-screen).
+        let mut cursor_moved = false;
+
         // Emacs-style tree navigation: Ctrl+N/P move the cursor, Ctrl+F/B
         // expand/collapse the row it's on, Enter opens a request (or
         // toggles expand for a collection/folder). Gated on no widget
@@ -1994,7 +2000,6 @@ impl App {
         // the command palette being closed, since it already claims
         // Ctrl+N/P for its own selection while open.
         if !rows.is_empty() && !self.search_open && ui.ctx().memory(|m| m.focused().is_none()) {
-            let mut cursor_moved = false;
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
                 self.tree_focused_index = Some(
                     self.tree_focused_index
@@ -2083,25 +2088,91 @@ impl App {
         // safe here since every row's content is already single-line
         // (long request names are truncated with an ellipsis, not wrapped).
         let row_height = ui.spacing().interact_size.y;
-        let tree_focused_index = self.tree_focused_index;
-        egui::ScrollArea::vertical()
+        let mut tree_focused_index = self.tree_focused_index;
+
+        // `row_height` (an *assumed* per-row height, `interact_size.y`) and
+        // the row's own *actual* rendered height disagree in practice — a
+        // real, measured gap (18 vs. ~20.9px per row, confirmed via
+        // `ScrollAreaOutput::content_size` during investigation), presumably
+        // from the row's font/padding being taller than the bare
+        // click-target minimum. `show_rows` itself tolerates this fine (its
+        // virtualization is only ever off by a row or two at the visible
+        // edge), but *my own* scroll-offset math below needs to target
+        // real pixels, so it uses this cached measurement (from the last
+        // frame's actual `content_size`) instead of the same assumed
+        // `row_height` — otherwise every offset it computes systematically
+        // undershoots, and Ctrl+N/P can walk the cursor off-screen forever
+        // without ever actually catching up to it.
+        let row_height_cache_id = egui::Id::new("collections_tree_measured_row_height");
+        let measured_row_height = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<f32>(row_height_cache_id))
+            .unwrap_or(row_height);
+
+        let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("collections_tree_rows")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, rows.len(), |ui, range| {
-                let start = range.start;
-                for (i, row) in rows[range].iter().enumerate() {
-                    render_tree_row(
-                        ui,
-                        row,
-                        &mut self.expanded_nodes,
-                        active_id,
-                        &open_ids,
-                        &mut renaming,
-                        &mut actions,
-                        tree_focused_index == Some(start + i),
-                    );
+            .auto_shrink([false, false]);
+        // Only force the scroll position on the frame Ctrl+N/P actually
+        // moved the cursor — reading the *previous* frame's offset via
+        // `scroll_area::State::load` so this only nudges the view exactly
+        // enough to bring the target row on-screen, not recentering on
+        // every keystroke and fighting a manual scroll.
+        //
+        // The id must be computed exactly like `ScrollArea::id_salt` does
+        // internally — `IdSalt::new(salt)` first, *then* `ui.id().with(...)`
+        // on that already-hashed `IdSalt`, not directly on the raw string.
+        // `Id::with` re-hashes whatever it's given through `IdSalt::new`
+        // regardless, so hashing the string directly here would silently
+        // hash different bytes (a `NonZeroU64` vs. the string's own bytes)
+        // and never match — `State::load` would then always return `None`,
+        // making every computed offset start from a false "0" baseline
+        // instead of the real persisted one. Caught by an actual snapshot
+        // showing the scroll stuck short of the focused row, not by
+        // inspection — worth remembering as a real gotcha, not a one-off.
+        if cursor_moved && let Some(idx) = tree_focused_index {
+            let scroll_id = ui.id().with(egui::IdSalt::new("collections_tree_rows"));
+            let viewport_height = ui.available_height();
+            let current_offset = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+                .map_or(0.0, |s| s.offset.y);
+            let row_top = idx as f32 * measured_row_height;
+            let row_bottom = row_top + measured_row_height;
+            let new_offset = if row_top < current_offset {
+                row_top
+            } else if row_bottom > current_offset + viewport_height {
+                row_bottom - viewport_height
+            } else {
+                current_offset
+            };
+            scroll_area = scroll_area.vertical_scroll_offset(new_offset);
+        }
+        let out = scroll_area.show_rows(ui, row_height, rows.len(), |ui, range| {
+            let start = range.start;
+            for (i, row) in rows[range].iter().enumerate() {
+                let activated = render_tree_row(
+                    ui,
+                    row,
+                    &mut self.expanded_nodes,
+                    active_id,
+                    &open_ids,
+                    &mut renaming,
+                    &mut actions,
+                    tree_focused_index == Some(start + i),
+                );
+                // A mouse click moves the keyboard cursor to match — a
+                // real, reported gap: clicking a row used to leave
+                // Ctrl+N/P still resuming from wherever it last was,
+                // completely ignoring what you'd just clicked.
+                if activated {
+                    tree_focused_index = Some(start + i);
                 }
-            });
+            }
+        });
+        if !rows.is_empty() {
+            let measured = out.content_size.y / rows.len() as f32;
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(row_height_cache_id, measured));
+        }
+        self.tree_focused_index = tree_focused_index;
 
         self.renaming = renaming;
 
@@ -3193,6 +3264,7 @@ impl App {
                                     };
                                     let selected = ui
                                         .selectable_label(idx == self.active_tab, name_text)
+                                        .on_hover_text(name)
                                         .clicked();
                                     if let Some(key) =
                                         hotkeys_by_request.get(&tab.current_request.id)
@@ -5712,6 +5784,10 @@ fn row_context_menu(
 /// (alongside Rename/Duplicate/Delete, which were already there), so every
 /// action is reachable regardless of expand state and every row stays a
 /// single fixed height, which `show_rows`-based virtualization requires.
+/// Returns whether this row was "activated" this frame (its name/label
+/// clicked, not just a secondary button like delete) — the caller uses
+/// this to move the Ctrl+N/P keyboard cursor to match a mouse click, so
+/// the two navigation methods never disagree about which row is current.
 fn render_tree_row(
     ui: &mut egui::Ui,
     row: &model::Row,
@@ -5721,7 +5797,7 @@ fn render_tree_row(
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
     focused: bool,
-) {
+) -> bool {
     const INDENT_PX: f32 = 16.0;
     // Emacs-style keyboard navigation cursor (Ctrl+N/P) — an accent-colored
     // outline, not a fill: a fill sat behind the row's own widgets and
@@ -5735,19 +5811,19 @@ fn render_tree_row(
     if focused {
         frame = frame.stroke(egui::Stroke::new(1.0, theme::ACCENT));
     }
-    frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(row.depth as f32 * INDENT_PX);
-            match &row.kind {
-                model::RowKind::Collection { id } => {
-                    render_collection_row(ui, *id, &row.name, expanded, renaming, actions);
-                }
-                model::RowKind::Folder {
-                    collection,
-                    parent_path,
-                    id,
-                } => {
-                    render_folder_row(
+    frame
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(row.depth as f32 * INDENT_PX);
+                match &row.kind {
+                    model::RowKind::Collection { id } => {
+                        render_collection_row(ui, *id, &row.name, expanded, renaming, actions)
+                    }
+                    model::RowKind::Folder {
+                        collection,
+                        parent_path,
+                        id,
+                    } => render_folder_row(
                         ui,
                         *collection,
                         parent_path,
@@ -5756,14 +5832,12 @@ fn render_tree_row(
                         expanded,
                         renaming,
                         actions,
-                    );
-                }
-                model::RowKind::Request {
-                    collection,
-                    folder_path,
-                    id,
-                } => {
-                    render_request_row(
+                    ),
+                    model::RowKind::Request {
+                        collection,
+                        folder_path,
+                        id,
+                    } => render_request_row(
                         ui,
                         *collection,
                         folder_path,
@@ -5775,11 +5849,12 @@ fn render_tree_row(
                         open_ids,
                         renaming,
                         actions,
-                    );
+                    ),
                 }
-            }
-        });
-    });
+            })
+            .inner
+        })
+        .inner
 }
 
 fn render_collection_row(
@@ -5789,7 +5864,7 @@ fn render_collection_row(
     expanded: &mut std::collections::HashSet<Uuid>,
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
-) {
+) -> bool {
     let (zone, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
         if renaming
             .as_ref()
@@ -5811,6 +5886,7 @@ fn render_collection_row(
             } else {
                 resp.request_focus();
             }
+            false
         } else {
             let is_open = expanded.contains(&collection_id);
             // See `expand_toggle_icon`'s own doc comment for why this is a
@@ -5827,6 +5903,7 @@ fn render_collection_row(
                         .truncate()
                         .frame(false),
                 )
+                .on_hover_text(name)
                 .clicked();
             if toggle_clicked || name_clicked {
                 if is_open {
@@ -5851,6 +5928,7 @@ fn render_collection_row(
                     });
                 }
             });
+            toggle_clicked || name_clicked
         }
     });
 
@@ -5942,6 +6020,7 @@ fn render_collection_row(
             ui.close();
         }
     });
+    zone.inner
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5954,7 +6033,7 @@ fn render_folder_row(
     expanded: &mut std::collections::HashSet<Uuid>,
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
-) {
+) -> bool {
     let mut child_path = parent_path.to_vec();
     child_path.push(folder_id);
     let payload = DragPayload::Folder {
@@ -5982,6 +6061,7 @@ fn render_folder_row(
             } else {
                 resp.request_focus();
             }
+            false
         } else {
             // A dedicated drag handle, separate from the expand toggle and
             // label — wrapping the whole row would intercept plain clicks
@@ -5996,6 +6076,7 @@ fn render_folder_row(
             // the collection row's identical treatment for why.
             let name_clicked = ui
                 .add(egui::Button::new(name).truncate().frame(false))
+                .on_hover_text(name)
                 .clicked();
             if toggle_clicked || name_clicked {
                 if is_open {
@@ -6024,6 +6105,7 @@ fn render_folder_row(
                     });
                 }
             });
+            toggle_clicked || name_clicked
         }
     });
 
@@ -6121,6 +6203,7 @@ fn render_folder_row(
             ui.close();
         }
     });
+    zone.inner
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6136,7 +6219,7 @@ fn render_request_row(
     open_ids: &std::collections::HashSet<Uuid>,
     renaming: &mut Option<(Uuid, String)>,
     actions: &mut Vec<PendingAction>,
-) {
+) -> bool {
     let payload = DragPayload::Request {
         collection: collection_id,
         folder_path: folder_path.to_vec(),
@@ -6170,6 +6253,7 @@ fn render_request_row(
             } else {
                 resp.request_focus();
             }
+            false
         } else {
             if let Some(method) = method {
                 ui.colored_label(theme::method_color(method), method.as_str());
@@ -6191,10 +6275,15 @@ fn render_request_row(
             } else {
                 display_name
             };
-            if ui
+            // `.on_hover_text(name)` — the raw name (no "• " decoration),
+            // since a long/imported name is exactly what `.truncate()`
+            // above cuts off with "…" and gives no other way to read in
+            // full without this.
+            let clicked = ui
                 .add(egui::Button::selectable(req_id == active_id, label).truncate())
-                .clicked()
-            {
+                .on_hover_text(name)
+                .clicked();
+            if clicked {
                 actions.push(PendingAction::Load {
                     collection: collection_id,
                     folder_path: folder_path.to_vec(),
@@ -6215,6 +6304,7 @@ fn render_request_row(
                     });
                 }
             });
+            clicked
         }
     });
 
@@ -6272,6 +6362,7 @@ fn render_request_row(
             ui.close();
         }
     });
+    zone.inner
 }
 
 /// Recursive rename-by-id search through a folder subtree (used by
@@ -8278,6 +8369,80 @@ mod tests {
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
         harness.step();
         assert_eq!(harness.state().tree_focused_index, Some(2));
+    }
+
+    /// Real, reported gap: clicking a row with the mouse used to leave the
+    /// Ctrl+N/P keyboard cursor exactly where it last was, so pressing
+    /// Ctrl+N right after a click resumed from some unrelated row instead
+    /// of the one just clicked. A click now moves the cursor to match.
+    #[test]
+    #[ignore]
+    fn clicking_a_row_moves_the_ctrl_n_p_cursor_to_match() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        collection.requests.push(RequestItem::new("Get Users"));
+        collection.requests.push(RequestItem::new("Create Order"));
+        data.collections.push(collection);
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| App::with_data(data));
+        harness.step();
+
+        harness.get_by_label("Demo").click();
+        harness.step();
+        harness.step(); // see the sibling test's comment on this two-step lag
+
+        // Rows are now: Demo(0), Get Users(1), Create Order(2).
+        harness.get_by_label("Create Order").click();
+        harness.step();
+        assert_eq!(
+            harness.state().tree_focused_index,
+            Some(2),
+            "the click should move the keyboard cursor to the clicked row"
+        );
+
+        // Ctrl+P from here should step to "Get Users", not resume from
+        // wherever an unrelated previous Ctrl+N/P session left off.
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::P);
+        harness.step();
+        assert_eq!(harness.state().tree_focused_index, Some(1));
+    }
+
+    /// Real, reported gap: pressing Ctrl+N repeatedly could walk the
+    /// keyboard cursor onto a row far below the visible area with the tree
+    /// never actually scrolling to follow it — traced to the scroll-offset
+    /// math using an *assumed* row height (`interact_size.y`) that
+    /// disagreed with the row's real rendered height, so every computed
+    /// offset systematically undershot. A snapshot, not a structural
+    /// assertion, since whether the target row is *visually* within the
+    /// scrolled viewport (not just present in the DOM) is exactly the
+    /// question — same reasoning as the command palette's own
+    /// `ctrl_n_scrolls_the_palette_to_keep_the_selection_visible`.
+    #[test]
+    #[ignore]
+    fn ctrl_n_scrolls_the_tree_to_keep_the_focused_row_visible() {
+        let mut data = AppData::default();
+        let mut collection = Collection::new("Demo");
+        for i in 0..40 {
+            collection
+                .requests
+                .push(RequestItem::new(format!("Request {i:02}")));
+        }
+        data.collections.push(collection);
+        let mut app = App::with_data(data);
+        app.expanded_nodes.insert(app.data.collections[0].id);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 750.0))
+            .build_eframe(|_cc| app);
+        harness.step();
+        for _ in 0..35 {
+            harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+            harness.step();
+        }
+        harness.snapshot("tree_ctrl_n_autoscroll");
     }
 
     /// The same Ctrl+N/P/Enter convention works on the History sidebar tab —
